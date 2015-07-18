@@ -9,26 +9,23 @@ foreach my $url (@ARGV) {
     my $response = HTTP::Tiny->new->get($url);
     die "Failed to fetch $url: $response->{status} $response->{reason}\n" unless $response->{success};
 
-    my $pages = 1;
+    my $pages = ($response->{content} =~ /data-page-total="(\d+)"/) ? $1 : 1;
     my $page = 1;
-    if ($response->{content} =~ /data-page-total="(\d+)"/) {
-	$pages = $1;
-	#print "Pages = $pages\n";
-    }
-
-    do {
+    while ($page <= $pages) {
 	$response = HTTP::Tiny->new->get("$url?page=$page");
 	die "Failed to fetch $url?page=$page: $response->{status} $response->{reason}\n" unless $response->{success};
 
 	my $content = $response->{content};
 	while ($content =~ m/data-ip-id="([a-zA-Z0-9]+)"/g) {
 	    my $pid = $1;
+	    # Note: the title search regexp match below uses a different variable for the page content so that
+	    # the global match position for the $content variable is not lost
 	    my $title = ($response->{content} =~ m!href="[^"]*/$pid/[^"]*"[^>]+title="([^"]*)"!) ? $1 : '';
 	    push @pids, $pid;
 	    print "$pid\t$title\n";
 	}
 
 	$page++;
-    } until $page > $pages;
+    };
 
 }
