@@ -20,32 +20,37 @@
 #
 # Author: Phil Lewis
 # Email: iplayer2 (at sign) linuxcentre.net
-# Web: http://www.infradead.org/get_iplayer/html/get_iplayer.html
+# Web: https://github.com/get-iplayer/get_iplayer/wiki
 # License: GPLv3 (see LICENSE.txt)
 #
 
-my $VERSION = 2.94;
+my $VERSION = 3.27;
 my $VERSION_TEXT;
 $VERSION_TEXT = sprintf("v%.2f", $VERSION) unless $VERSION_TEXT;
 
-use strict;
 use CGI qw(-utf8 :all);
 use CGI::Cookie;
-use IO::File;
+use Cwd 'abs_path';
+use Encode qw(:DEFAULT :fallback_all);
+use Getopt::Long;
+use File::Basename;
 use File::Copy;
 use HTML::Entities;
+use IO::File;
+use IO::Handle;
+use IPC::Open3;
 use LWP::ConnCache;
 #use LWP::Debug qw(+);
 use LWP::UserAgent;
-use IO::Handle;
-use Getopt::Long;
-use Cwd 'abs_path';
-use File::Basename;
-use Encode qw(:DEFAULT :fallback_all);
 use PerlIO::encoding;
-$PerlIO::encoding::fallback = XMLCREF;
+use strict;
 use constant IS_WIN32 => $^O eq 'MSWin32' ? 1 : 0;
+use constant DEFAULT_THUMBNAIL => "https://ichef.bbci.co.uk/images/ic/480xn/p01tqv8z.png";
+$PerlIO::encoding::fallback = XMLCREF;
+# suppress Perl 5.22/CGI 4 warning
+$CGI::LIST_CONTEXT_WARN = 0;
 $| = 1;
+
 my $fh;
 # Send log messages to this fh
 my $se = *STDERR;
@@ -64,6 +69,7 @@ GetOptions(
 	"ffmpeg=s"			=> \$opt_cmdline->{ffmpeg},
 	"encodinglocalefs|encoding-locale-fs=s"	=> \$opt_cmdline->{encodinglocalefs},
 	"debug"				=> \$opt_cmdline->{debug},
+	"baseurl|base-url|b=s"		=> \$opt_cmdline->{baseurl},
 ) || die usage();
 
 # Display usage if old method of invocation is used or --help
@@ -75,8 +81,8 @@ sub usage {
 	my $text = "get_iplayer Web PVR Manager $VERSION_TEXT, ";
 	$text .= <<'EOF';
 Copyright (C) 2009-2010 Phil Lewis
-  This program comes with ABSOLUTELY NO WARRANTY; This is free software, 
-  and you are welcome to redistribute it under certain conditions; 
+  This program comes with ABSOLUTELY NO WARRANTY; This is free software,
+  and you are welcome to redistribute it under certain conditions;
   See the GPLv3 for details.
 
 Options:
@@ -84,13 +90,14 @@ Options:
  --port,-p          Use the built-in web server and listen on this TCP port
  --getiplayer,-g    Path to the get_iplayer script
  --ffmpeg           Path to the ffmpeg binary
- --encodinglocalefs Encoding for file names (default: Linux/Unix/OSX = UTF-8, Windows = cp1252) 
+ --encodinglocalefs Encoding for file names (default: Linux/Unix/OSX = UTF-8, Windows = cp1252)
  --debug            Debug mode
+ --baseurl,-b       Base URL for link generation. Set to full proxy URL if running behind reverse proxy.
  --help,-h          This help text
 EOF
 	print $text;
 	exit 1;
-}	
+}
 
 
 # Some defaults
@@ -106,34 +113,9 @@ if ( ( ! $opt_cmdline->{getiplayer} ) || ! -f $opt_cmdline->{getiplayer} ) {
 	print "ERROR: Cannot find get_iplayer, please specify its location using the --getiplayer option.\n";
 	exit 2;
 }
-if ( ! $opt_cmdline->{encodinglocalefs} ) {
-	chomp(my @encodinglocalefs = map { s/^\s*encodinglocalefs\s*=\s*// ? $_ : () } 
-		get_cmd_output(
-			$opt_cmdline->{getiplayer},
-			'--encoding-locale=UTF-8',
-			'--encoding-console-out=UTF-8',
-			'--nopurge',
-			'--nocopyright',
-			'--showoptions'
-		)
-	);
-	$opt_cmdline->{encodinglocalefs} = pop @encodinglocalefs;
-}
-$opt_cmdline->{encodinglocalefs} = (IS_WIN32 ? 'cp1252' : 'utf8') if ! $opt_cmdline->{encodinglocalefs};
-if ( ! $opt_cmdline->{ffmpeg} ) {
-	chomp(my @ffmpeg = map { s/^\s*ffmpeg\s*=\s*// ? $_ : () } 
-		get_cmd_output(
-			$opt_cmdline->{getiplayer},
-			'--encoding-locale=UTF-8',
-			'--encoding-console-out=UTF-8',
-			'--nopurge',
-			'--nocopyright',
-			'--showoptions'
-		)
-	);
-	$opt_cmdline->{ffmpeg} = pop @ffmpeg;
-}
-$opt_cmdline->{ffmpeg} = 'ffmpeg' if ! $opt_cmdline->{ffmpeg};
+$opt_cmdline->{encodinglocalefs} ||= (IS_WIN32 ? 'cp1252' : 'utf8');
+$opt_cmdline->{ffmpeg} ||= 'ffmpeg';
+$opt_cmdline->{baseurl} .= "/" if $opt_cmdline->{baseurl} && $opt_cmdline->{baseurl} !~ m{/$};
 
 # Path to get_iplayer (+ set HOME env var cos apache seems to not set it)
 my $home = $ENV{HOME};
@@ -143,11 +125,12 @@ my @pids;
 my @displaycols;
 
 # Field names to be grabbed from get_iplayer
-my @headings = qw( 
+my @headings = qw(
 	index
 	thumbnail
 	pid
 	available
+	expires
 	type
 	name
 	episode
@@ -166,13 +149,14 @@ my @headings = qw(
 );
 
 # Default Displayed headings
-my @headings_default = qw( thumbnail type name episode desc channel categories timeadded );
+my @headings_default = qw( thumbnail type name episode desc channel timeadded );
 
 # Lookup table for nice field name headings
 my %fieldname = (
 	index			=> 'Index',
-	pid			=> 'Pid',
-	available		=> 'Availability',
+	pid			=> 'PID',
+	available		=> 'Available',
+	expires		=> 'Expires',
 	type			=> 'Type',
 	name			=> 'Name',
 	episode			=> 'Episode',
@@ -200,41 +184,13 @@ my %cols_names = ();
 
 my %prog_types = (
 	tv	=> 'BBC TV',
-	radio	=> 'BBC Radio',
-	podcast	=> 'BBC Podcast',
-	livetv	=> 'Live BBC TV',
-	liveradio => 'Live BBC Radio',
+	radio	=> 'BBC Radio'
 );
 
 my %prog_types_order = (
 	1	=> 'tv',
-	2	=> 'radio',
-	3	=> 'podcast',
-	4	=> 'livetv',
-	5	=> 'liveradio',
+	2	=> 'radio'
 );
-
-# Get list of currently valid and prune %prog types and add new entry
-chomp( my @plugins = split /,/, join "\n", get_cmd_output( $opt_cmdline->{getiplayer}, '--encoding-locale=UTF-8', '--encoding-console-out=UTF-8','--nopurge', '--nocopyright', '--listplugins' ) );
-for my $type (keys %prog_types) {
-	if ( $prog_types{$type} && not grep /$type/, @plugins ) {
-		# delete from %prog_types hash
-		delete $prog_types{$type};
-		# Delete from %prog_types_order hash
-		for ( keys %prog_types_order ) {
-			delete $prog_types_order{$_} if $prog_types_order{$_} eq $type; 
-		}
-	}
-}
-for my $type ( @plugins ) {
-	if ( not $prog_types{$type} ) {
-		$prog_types{$type} = $type;
-		# Add to %prog_types_order hash
-		my $max = scalar( keys %prog_types_order ) + 1;
-		$prog_types_order{$max} = $type;
-	}
-}
-#print "DEBUG: prog_types_order: $_ => $prog_types_order{$_}\n" for sort keys %prog_types_order;
 
 my $icons_base_url = './icons/';
 
@@ -256,7 +212,6 @@ my %nextpages = (
 	'record_now'		=> \&record_now,
 	'show_info'		=> \&show_info,
 	'refresh'		=> \&refresh,
-	'update_script'		=> \&update_script,
 );
 
 
@@ -272,7 +227,7 @@ $layout->{BASICTAB}->{order} = [ qw/ SEARCH SEARCHFIELDS PROGTYPES HISTORY URL /
 
 $layout->{SEARCHTAB}->{title} = 'Advanced Search';
 $layout->{SEARCHTAB}->{heading} = 'Advanced Search Options:';
-$layout->{SEARCHTAB}->{order} = [ qw/ VERSIONLIST EXCLUDE CATEGORY EXCLUDECATEGORY CHANNEL EXCLUDECHANNEL SINCE BEFORE FUTURE / ],
+$layout->{SEARCHTAB}->{order} = [ qw/ EXCLUDE CATEGORY EXCLUDECATEGORY CHANNEL EXCLUDECHANNEL SINCE BEFORE FUTURE / ],
 
 $layout->{DISPLAYTAB}->{title} = 'Display';
 $layout->{DISPLAYTAB}->{heading} = 'Display Options:';
@@ -284,7 +239,7 @@ $layout->{COLUMNSTAB}->{order} = [ qw/ COLS / ];
 
 $layout->{RECORDINGTAB}->{title} = 'Recording';
 $layout->{RECORDINGTAB}->{heading} = 'Recording Options:';
-$layout->{RECORDINGTAB}->{order} = [ qw/ OUTPUT MODES PROXY SUBTITLES METADATA THUMB PVRHOLDOFF FORCE AUTOWEBREFRESH AUTOPVRRUN REFRESHFUTURE / ];
+$layout->{RECORDINGTAB}->{order} = [ qw/ OUTPUT VERSIONLIST MODES PROXY SUBTITLES METADATA THUMB PVRHOLDOFF FORCE AUTOWEBREFRESH AUTOPVRRUN REFRESHFUTURE FPS25 / ];
 
 $layout->{STREAMINGTAB}->{title} = 'Streaming';
 $layout->{STREAMINGTAB}->{heading} = 'Streaming Options:';
@@ -303,6 +258,7 @@ my @nosearch_params = qw/ /;
 ### Perl CGI Web Server ###
 use Socket;
 use IO::Socket;
+use POSIX ":sys_wait_h";
 my $IGNOREEXIT = 0;
 # If the port number is specified then run embedded web server
 if ( $opt_cmdline->{port} > 0 ) {
@@ -322,6 +278,7 @@ if ( $opt_cmdline->{port} > 0 ) {
 		$server or die "Unable to create server socket: $!";
 		print $se "INFO: Listening on $opt_cmdline->{listen}:$opt_cmdline->{port}\n";
 		print $se "WARNING: Insecure Remote access is allowed, use --listen=127.0.0.1 to limit to this host only\n" if $opt_cmdline->{listen} ne '127.0.0.1';
+		print $se "INFO: Using base URL $opt_cmdline->{baseurl}\n" if $opt_cmdline->{baseurl};
 		# Await requests and handle them as they arrive
 		while (my $client = $server->accept()) {
 			my $procid = fork();
@@ -329,6 +286,10 @@ if ( $opt_cmdline->{port} > 0 ) {
 			# Parent
 			if ( $procid ) {
 				close $client;
+				# must call waitpid() on Windows
+				if ( IS_WIN32 ) {
+					while ( abs(waitpid(-1, WNOHANG)) > 1 ) {}
+				}
 				next;
 			}
 			# Child
@@ -373,11 +334,11 @@ if ( $opt_cmdline->{port} > 0 ) {
 					$query_string = $request{CONTENT};
 				}
 				$data{"_method"} = "GET";
-	
+
 			} elsif ($request{METHOD} eq 'POST') {
 				$query_string = parse_post_form_string( $request{CONTENT} );
 				$data{"_method"} = "POST";
-	
+
 			} else {
 				$data{"_method"} = "ERROR";
 			}
@@ -386,7 +347,7 @@ if ( $opt_cmdline->{port} > 0 ) {
 			print $se "$data{_method}: $request{URL}\n";
 
 			# Is this the CGI or some other file request?
-			if ( $request{URL} =~ /^\/?(iplayer|stream|recordings_delete|playlist.*|genplaylist.*|opml|)\/?$/ ) {
+			if ( $request{URL} =~ /^\/?(recordings_delete|playlist.+|genplaylist.+|)\/?$/ ) {
 				# remove any vars that might affect the CGI
 				#%ENV = ();
 				@ARGV = ();
@@ -396,10 +357,15 @@ if ( $opt_cmdline->{port} > 0 ) {
 				$ENV{'REQUEST_URI'} = $request{URL};
 				$ENV{'COOKIE'} = $request{cookie};
 				$ENV{'SERVER_PORT'} = $opt_cmdline->{port};
+				my $request_host = "http://$request{host}/";
+				if ( $opt_cmdline->{baseurl} ) {
+					$ENV{'REQUEST_URI'} = $opt_cmdline->{baseurl};
+					$request_host = $opt_cmdline->{baseurl};
+				}
 				# respond OK to browser
 				print $client "HTTP/1.1 200 OK", Socket::CRLF;
 				# Invoke CGI
-				run_cgi( $client, $query_string, $request{URL}, 'http://'.$request{host}.'/' );
+				run_cgi( $client, $query_string, $request{URL}, $request_host );
 
 			# Else 404
 			} else {
@@ -514,129 +480,52 @@ sub run_cgi {
 	my $action = $cgi->param( 'ACTION' ) || $request_uri;
 	# Strip the leading '/' to get the action
 	$action =~ s|^\/||g;
-	# rewrite short-form backwards compatible URIs
-	# e.g. http://server/stream?args -> http://server/get_iplayer.cgi?ACTION=stream&args
 
-	# Stream from get_iplayer STDOUT (optionally transcoding if required)
-	if ( $action eq 'stream' ) {
-		binmode $fh, ':raw';
-		my $ext = $cgi->param( 'OUTTYPE' ) || 'flv';
-		# Remove fileprefix
-		$ext =~ s/^.*\.//g;
-		# lowecase
-		$ext = lc( $ext );
-		# Stream mime types (tweaked to work well in vlc)
-		my %mimetypes = (
-			wav 	=> 'audio/x-wav',
-			flac	=> 'audio/x-flac',
-			mp3 	=> 'audio/mpeg',
-			aac	=> 'audio/mpeg',
-			m4a	=> 'audio/mpeg',
-			rm	=> 'audio/x-pn-realaudio',
-			mov 	=> 'video/quicktime',
-			mp4	=> 'video/x-flv',
-			avi	=> 'video/x-flv',
-			flv	=> 'video/x-flv',
-			asf	=> 'video/x-ms-asf',
-			ts => 'video/mp2ts',
-		);
-
-		# Default mime type depending on mode
-		####$ext = 'flv' if $opt->{MODES}->{current} =~ /^flash/ && ! $ext;
-
-		# Streamtype overrides any outtype
-		$ext = $opt->{STREAMTYPE}->{current} if $opt->{STREAMTYPE}->{current} !~ /(none|^$)/i;
-
-		# If mimetype is defined
-		if ( $mimetypes{$ext} ) {
-			my $notranscode = 0;
-
-			# flv audio
-			$mimetypes{flv} = 'audio/x-flv' if $opt->{PROGTYPES}->{current} =~ m{^(radio|liveradio|podcast)$};
-
-			# Output headers to stream 
-			# This will enable seekable: -Accept_Ranges=>'bytes',
-			my $headers = $cgi->header( -type => $mimetypes{$ext}, -Connection => 'close' );
-
-			# Send the headers to the browser
-			print $se "\r\nHEADERS:\n$headers\n"; #if $opt_cmdline->{debug};
-			print $fh $headers;
-
-			# Default Recipies
-			# Need to determine --type and then set the default --modes and default outtype for conversion if required
-			if ( $opt->{PROGTYPES}->{current} eq 'livetv' ) {
-				print $se "INFO: Transcoding disabled for livetv\n";
-				$notranscode = 1;
-				$ext = 'ts';
-			}
-			# No conversion for iphone radio as mp3
-			$ext = undef if $opt->{MODES}->{current} eq 'iphone' && $ext eq 'mp3';
-			# No conversion for realaudio radio as rm
-			$ext = undef if $opt->{MODES}->{current} eq 'realaudio' && $ext eq 'rm';
-			# stream mp3 natively
-			$ext = undef if $ext eq 'mp3';
-			# No conversion for flv
-			## $ext = undef if $ext eq 'flv';
-			# Disable transcoing if none is specified as OUTTYPE/STREAMTYPE - no point in doing this as we have then no idea of the mimetype
-			### Need a way to disable transcoding here - pass and check STREAMTYPE?
-			if ( $opt->{STREAMTYPE}->{current} =~ /none/i ) {
-				print $se "INFO: Transcoding disabled (OUTTYPE=none)\n";
-				$ext = undef;
-				$notranscode = 1;
-			}
-			# no transcode if $ext is undefined
-			stream_prog( $mimetypes{$ext}, $cgi->param( 'PID' ), $cgi->param( 'PROGTYPES' ), $opt->{MODES}->{current}, $ext, $notranscode, $opt->{BITRATE}->{current}, $opt->{VSIZE}->{current}, $opt->{VFR}->{current} );
-		} else {
-			print $se "ERROR: Aborting client thread - output mime type is undetermined\n";
-		}
-
-	} elsif ( $action eq 'direct' ) {
+	# Stream from file (optionally transcoding if required)
+	if ( $action eq 'direct' || $action eq 'playdirect' ) {
 		binmode $fh, ':raw';
 		# get filename first
 		my $progtype = $cgi->param( 'PROGTYPES' );
 		my $pid = $cgi->param( 'PID' );
-		# If the modes list f set to nothing
-		#my $mode = $opt->{MODES}->{current} || $opt->{MODES}->{default};
 		my $mode = $cgi->param( 'MODES' );
 		my $filename = get_direct_filename( $pid, $mode, $progtype );
-		# Use OUTTYPE for transcoding if required - get output ext
-		# $cgi->param('STREAMTYPE') || $cgi->param('OUTTYPE') || 'flv' if $action eq 'playlistdirect';
 		my $ext = lc( $cgi->param('STREAMTYPE') || $cgi->param( 'OUTTYPE' ) );
-		# Remove fileprefix
-		$ext =~ s/^.*\.//g;
 		# get file source ext
 		my $src_ext = $filename;
 		$src_ext =~ s/^.*\.//g;
 		# Stream mime types
 		my %mimetypes = (
-			wav 	=> 'audio/x-wav',
+			aac	=> 'audio/aac',
+			adts	=> 'audio/aac',
 			flac	=> 'audio/x-flac',
-			aac	=> 'audio/mpeg',
-			m4a	=> 'audio/mpeg',
+			m4a	=> 'audio/mp4',
 			mp3 	=> 'audio/mpeg',
-			rm	=> 'audio/x-pn-realaudio',
+			oga => 'audio/vorbis',
+			wav 	=> 'audio/x-wav',
+			asf	=> 'video/x-ms-asf',
+			avi	=> 'video/avi',
+			flv	=> 'video/x-flv',
+			matroska => 'video/x-matroska',
+			mkv => 'video/x-matroska',
 			mov 	=> 'video/quicktime',
 			mp4	=> 'video/mp4',
-			avi	=> 'video/x-flv',
-			flv	=> 'video/x-flv',
-			asf	=> 'video/x-ms-asf',
+			mpegts	=> 'video/MP2T',
+			rm	=> 'audio/x-pn-realaudio',
+			ts	=> 'video/MP2T',
 		);
 
-		# default recipies
-		# Disable transcoding if none is specified as OUTTYPE/STREAMTYPE
+		# default recipes
 		my $notranscode = 0;
+		# Disable transcoding if none is specified as OUTTYPE/STREAMTYPE
+		# Or if streaming MP4 via play direct
 		if ( $ext =~ /none/i ) {
-			print $se "INFO: Transcoding disabled (OUTTYPE=none)\n";
-			$ext = $src_ext;
-			$notranscode = 1;
-
-		# cannot stream mp4/avi so transcode to flv
-		# Add types here which you want re-muxed into flv
-		#if ( $src_ext =~ m{^(mp4|avi|mov|mp3|aac)$} && ! $ext ) {
-		} elsif ( $src_ext =~ m{^(mp4|m4a|aac|avi|mov)$} && ! $ext ) {
+				print $se "INFO: Transcoding disabled (OUTTYPE=$ext)\n";
+				$ext = $src_ext;
+				$notranscode = 1;
+		# Else known types re-mux into flv unless play direct
+		} elsif ( $action ne 'playdirect' && ! $ext && $src_ext =~ m{^(m4a|mp4|mp3|aac|avi|mkv|mov|ts)$} ) {
 			$ext = 'flv';
-
-		# Else Default to no transcoding
+		# Else default to no transcoding
 		} elsif ( ! $ext ) {
 			$ext = $src_ext;
 		}
@@ -647,7 +536,7 @@ sub run_cgi {
 		if ( $mimetypes{$ext} ) {
 
 			# Output headers
-			# to stream 
+			# to stream
 			# This will enable seekable -Accept_Ranges=>'bytes',
 			my $headers = $cgi->header( -type => $mimetypes{$ext}, -Connection => 'close' );
 
@@ -661,34 +550,7 @@ sub run_cgi {
 		}
 
 	# Get a playlist for a specified 'PROGTYPES'
-	} elsif ( $action eq 'playlist' || $action eq 'playlistdirect' || $action eq 'playlistfiles' ) {
-		# Output headers
-		my $headers = $cgi->header( -type => 'audio/x-mpegurl' );
-
-		# Send the headers to the browser
-		print $se "\r\nHEADERS:\n$headers\n"; #if $opt_cmdline->{debug};
-		print $fh $headers;
-
-		# determine output type
-		my $outtype = $cgi->param('OUTTYPE') || 'flv';
-		$outtype = $cgi->param('STREAMTYPE') || $cgi->param('OUTTYPE') || 'flv' if $action eq 'playlistdirect';
-
-		# ( host, outtype, modes, progtype, bitrate, search, searchfields, action )
-		print $fh create_playlist_m3u_single( $request_host, $outtype, $opt->{MODES}->{current}, $opt->{PROGTYPES}->{current} , $cgi->param('BITRATE') || '', $opt->{SEARCH}->{current}, $opt->{SEARCHFIELDS}->{current} || 'name', $action );
-
-	# Get a playlist for a specified 'PROGTYPES'
-	} elsif ( $action eq 'opml' ) {
-		# Output headers
-		my $headers = $cgi->header( -type => 'text/xml' );
-
-		# Send the headers to the browser
-		print $se "\r\nHEADERS:\n$headers\n"; #if $opt_cmdline->{debug};
-		print $fh $headers;
-		# ( host, outtype, modes, type, bitrate )
-		print $fh get_opml( $request_host, $cgi->param('OUTTYPE') || 'flv', $opt->{MODES}->{current}, $opt->{PROGTYPES}->{current} , $cgi->param('BITRATE') || '', $opt->{SEARCH}->{current}, $cgi->param('LIST') || '' );
-
-	# Get a playlist for a selected progs in form
-	} elsif ( $action eq 'genplaylist' || $action eq 'genplaylistdirect' || $action eq 'genplaylistfile' ) {
+	} elsif ( $action eq 'playlistdirect' || $action eq 'playlistfiles' ) {
 		# Output headers
 		my $headers = $cgi->header( -type => 'audio/x-mpegurl' );
 		# To save file
@@ -697,9 +559,27 @@ sub run_cgi {
 		# Send the headers to the browser
 		print $se "\r\nHEADERS:\n$headers\n"; #if $opt_cmdline->{debug};
 		print $fh $headers;
-		
+
 		# determine output type
-		my $outtype = $cgi->param('OUTTYPE') || 'flv';
+		my $outtype = $cgi->param('OUTTYPE');
+		$outtype = $cgi->param('STREAMTYPE') || $cgi->param('OUTTYPE') if $action eq 'playlistdirect';
+
+		# ( host, outtype, modes, progtype, bitrate, search, searchfields, action )
+		print $fh create_playlist_m3u_single( $request_host, $outtype, $opt->{MODES}->{current}, $opt->{PROGTYPES}->{current} , $cgi->param('BITRATE') || '', $opt->{SEARCH}->{current}, $opt->{SEARCHFIELDS}->{current} || 'name', $opt->{VERSIONLIST}->{current}, $action );
+
+	# Get a playlist for a selected progs in form
+	} elsif ( $action eq 'genplaylistdirect' || $action eq 'genplaylistfile' ) {
+		# Output headers
+		my $headers = $cgi->header( -type => 'audio/x-mpegurl' );
+		# To save file
+		#my $headers = $cgi->header( -type => 'audio/x-mpegurl', -attachment => 'get_iplayer.m3u' );
+
+		# Send the headers to the browser
+		print $se "\r\nHEADERS:\n$headers\n"; #if $opt_cmdline->{debug};
+		print $fh $headers;
+
+		# determine output type
+		my $outtype = $cgi->param('OUTTYPE');
 		$outtype = $cgi->param('STREAMTYPE') || $cgi->param('OUTTYPE') if $action eq 'genplaylistdirect';
 
 		# ( host, outtype, modes, bitrate, action )
@@ -717,7 +597,7 @@ sub run_cgi {
 			print $fh $cgi->Dump();
 			#for my $key (sort keys %ENV) {
 			#    print $fh $key, " = ", $ENV{$key}, "\n";
-			#}    
+			#}
 		}
 		if ($nextpages{$nextpage}) {
 			# call the correct subroutine
@@ -736,12 +616,15 @@ sub run_cgi {
 
 sub pvr_run {
 	print $fh "<strong><p>The PVR will auto-run every $opt->{AUTOPVRRUN}->{current} hour(s) if you leave this page open</p></strong>" if $opt->{AUTOPVRRUN}->{current};
+	if ( IS_WIN32 ) {
+		print $fh "<strong><p>Windows users: You may encounter errors if you perform other tasks in the Web PVR Manager while this page is reloading</p></strong>" if $opt->{AUTOPVRRUN}->{current};
+		print $fh "<strong><p>Windows users: The Web PVR Manager may crash if you leave this window open for a long period of time</p></strong>" if $opt->{AUTOPVRRUN}->{current};
+	}
 	print $se "INFO: Starting PVR Run\n";
 	my @cmd = (
 		$opt_cmdline->{getiplayer},
 		'--encoding-locale=UTF-8',
 		'--encoding-console-out=UTF-8',
-		'--nopurge',
 		'--nocopyright',
 		'--hash',
 		'--pvr',
@@ -796,7 +679,7 @@ sub record_now {
 	my $out;
 
 	# If a URL was specified by the User (assume auto mode list is OK):
-	if ( $opt->{URL}->{current} =~ m{^http://} ) {
+	if ( $opt->{URL}->{current} =~ m{^https?://} ) {
 		push @record, "$opt->{PROGTYPES}->{current}|$opt->{URL}->{current}|$opt->{URL}->{current}|-";
 	}
 
@@ -835,7 +718,6 @@ sub record_now {
 			$opt_cmdline->{getiplayer},
 			'--encoding-locale=UTF-8',
 			'--encoding-console-out=UTF-8',
-			'--nopurge',
 			'--nocopyright',
 			'--expiry=999999999',
 			'--hash',
@@ -843,7 +725,7 @@ sub record_now {
 			get_iplayer_webrequest_args(
 				"pid=$pid",
 				"type=$type",
-				build_cmd_options( grep !/^(HISTORY|SINCE|BEFORE|HIDEDELETED|FUTURE|SEARCH|SEARCHFIELDS|VERSIONLIST|PROGTYPES|EXCLUDEC.+)$/, @params )
+				build_cmd_options( grep !/^(HISTORY|SINCE|BEFORE|HIDEDELETED|FUTURE|SEARCH|SEARCHFIELDS|PROGTYPES|EXCLUDEC.+)$/, @params )
 			),
 		);
 		print $fh p("Command: ".( join ' ', @cmd ) ) if $opt_cmdline->{debug};
@@ -858,62 +740,6 @@ sub record_now {
 
 
 
-sub stream_prog {
-	my ( $mimetype, $pid , $type, $modes, $ext, $notranscode, $abitrate, $vsize, $vfr ) = ( @_ );
-	# Default modes to try
-	$modes = $default_modes if ! $modes;
-	
-	print $se "INFO: Start Streaming $pid to browser using modes '$modes', output ext '$ext', audio bitrate '$abitrate', video size '$vsize', video frame rate '$vfr'\n";
-
-	my @cmd = (
-		$opt_cmdline->{getiplayer},
-		'--encoding-locale=UTF-8',
-		'--encoding-console-out=UTF-8',
-		'--nocopyright',
-		'--hash',
-		'--expiry=999999999',
-		'--webrequest',
-		get_iplayer_webrequest_args( 'nopurge=1', "modes=$modes", 'stream=1', "pid=$pid", "type=$type" ),
-	);
-
-	# If transcoding on the fly then use shell method of calling processes with a pipe
-	if ( $ext && ! $notranscode ) {
-
-		# workaround to add quotes around the args because we are using a shell here
-		for ( @cmd ) {
-			s/^(.+)$/"$1"/g if ! m{^[\-\"]};
-		}
-		my $command = join(' ', @cmd);
-		open(STDOUT, ">&", $fh ) || die "can't dup client to stdout";
-
-		# Enable buffering
-		STDOUT->autoflush(0);
-		$fh->autoflush(0);
-
-		# add ffmpeg command pipe
-		my @ffcmd = build_ffmpeg_args( '-', $mimetype, $ext, $abitrate, $vsize, $vfr );
-
-		# quote the ffmpeg binary
-		$ffcmd[0] = "\"$ffcmd[0]\"";
-
-		# Prepend the pipe
-		unshift @ffcmd, '|';
-		$command .= ' '.join ' ', @ffcmd;
-
-		print $se "DEBUG: Command: $command\n";
-		system( $command );
-
-	} else {
-		run_cmd( $fh, $se, 100000, @cmd );
-	}
-
-	print $se "INFO: Finished Streaming $pid to browser\n";
-
-	return 0;
-}
-
-
-			
 # Stream a file to browser/client
 sub stream_file {
 	my ( $filename, $mimetype, $src_ext, $ext, $notranscode, $abitrate, $vsize, $vfr ) = ( @_ );
@@ -962,72 +788,41 @@ sub stream_file {
 
 sub build_ffmpeg_args {
 		my ( $filename, $mimetype, $ext, $abitrate, $vsize, $vfr, $src_ext ) = ( @_ );
-		my @cmd_aopts;
-		my $src_mimetype = $mimetype;
-		# mime type override for audio->flv conversion
-		if ( lc( $src_ext ) =~ m{^(aac|m4a|mp3)$} ) {
-			$src_mimetype = 'audio/mpeg';
-		}
-
-		if ( $abitrate =~ m{^\d+$} ) {
-			if ( lc( $ext ) eq 'flv' ) {
-				push @cmd_aopts, ( '-ar', '44100', '-ab', "${abitrate}k" );
-			} else {
-				push @cmd_aopts, ( '-ab', "${abitrate}k" );
-			}
-		} else {
-			if ( lc( $ext ) eq 'flv' ) {
-				push @cmd_aopts, ( '-ar', '44100' );
-			}
-			# cannot copy code if for example we have an aac stream output as WAV (e.g. squeezebox liveradio flashaac)
-			#push @cmd_aopts, ( '-acodec', 'copy' );
-		}
-
 		my @cmd;
+		my @cmd_vopts;
+		my @cmd_aopts;
+		if ( $abitrate =~ m{^\d+$} ) {
+			push @cmd_aopts, ( '-ab', "${abitrate}k" );
+		}
+		if ( lc( $ext ) eq 'flv' ) {
+			push @cmd_aopts, ( '-ar', '44100' );
+		}
 		# If conversion is necessary
 		# Video
-		if ( $src_mimetype =~ m{^video} ) {
-			my @cmd_vopts;
-
+		if ( $mimetype =~ m{^video} && $filename !~ m{\.(aac|m4a|mp3)$} ) {
 			# Apply video size
 			push @cmd_vopts, ( '-s', "${vsize}" ) if $vsize =~ m{^\d+x\d+$};
-
 			# Apply video framerate - caveat - bitrate defaults to 200k if only vfr is set
-			push @cmd_vopts, ( '-r', $vfr ) if $vfr =~ m{^\d$};
-			
-			# -sameq is bad
-			## Apply sameq if framerate only and no bitrate
-			#push @cmd_vopts, '-sameq' if $vfr =~ m{^\d$} && $vsize !~ m{^\d+x\d+$};
-
+			push @cmd_vopts, ( '-r', $vfr ) if $vfr =~ m{^\d+$};
 			# Add in the codec if we are transcoding and not remuxing the stream
 			if ( @cmd_vopts ) {
 				push @cmd_vopts, ( '-vcodec', 'libx264' );
 			} else {
 				push @cmd_vopts, ( '-vcodec', 'copy' );
 			}
-
-			@cmd = (
-				$opt_cmdline->{ffmpeg},
-				#'-f', $src_ext, # not required?
-				'-i', $filename,
-				@cmd_aopts,
-				@cmd_vopts,					
-				'-f', $ext,
-				'-',
-			);
 		# Audio
 		} else {
-			@cmd = (
-				$opt_cmdline->{ffmpeg},
-				#'-f', $src_ext, # not required?
-				'-i', $filename,
-				'-vn',
-				@cmd_aopts,
-				'-ac', 2,
-				'-f', $ext,
-				'-',
-			);
+				push @cmd_vopts, ( '-vn' );
 		}
+		@cmd = (
+			$opt_cmdline->{ffmpeg},
+			'-i', $filename,
+			@cmd_vopts,
+			@cmd_aopts,
+			'-ac', 2,
+			'-f', $ext,
+			'-',
+		);
 		print $se "DEBUG: Command args: ".(join ' ', @cmd)."\n";
 		return @cmd;
 }
@@ -1035,22 +830,16 @@ sub build_ffmpeg_args {
 
 
 sub create_playlist_m3u_single {
-	my ( $request_host, $outtype, $modes, $type, $bitrate, $search, $searchfields, $request ) = ( @_ );
+	my ( $request_host, $outtype, $modes, $type, $bitrate, $search, $searchfields, $versionlist, $request ) = ( @_ );
 	my @playlist;
 	$outtype =~ s/^.*\.//g;
 
 	my $searchterm = $search;
-	# this is already a wildcard default regex...
-	if ( $search eq '.*' ) {
-		$searchterm = '.*';
-	# if it's a URL then bypass regex stuff
-	} elsif ( $search =~ m{^http} ) {
-		$searchterm = $search;
 	# make search term regex friendly
-	} else {
+	if ( $searchterm ne '.*' && $searchterm !~ m{^http} ) {
 		$searchterm =~ s|([\/\.\?\+\-\*\^\(\)\[\]\{\}])|\\$1|g;
 	}
-		
+
 	print $se "INFO: Getting playlist for type '$type' using modes '$modes' and bitrate '$bitrate'\n";
 	my @cmd = (
 		$opt_cmdline->{getiplayer},
@@ -1059,12 +848,9 @@ sub create_playlist_m3u_single {
 		'--nocopyright',
 		'--expiry=999999999',
 		'--webrequest',
-		get_iplayer_webrequest_args( 'nopurge=1', "type=$type", 'listformat=ENTRY|<pid>|<name>|<episode>|<desc>|<filename>|<mode>', "fields=$searchfields", "search=$searchterm" ),
+		get_iplayer_webrequest_args( 'history=1', 'skipdeleted=1', 'nopurge=1', "type=$type", 'listformat=ENTRY|<pid>|<name>|<episode>|<desc>|<filename>|<mode>', "fields=$searchfields", "search=$searchterm", "versionlist=$versionlist" ),
 	);
-	# Only add history search if the request is of this type or is a PlayFile from localfiles type
-	if ( ( $request eq 'playlistfiles' || $request eq 'playlistdirect' ) && ! ( $search =~ m{^/} && $searchfields eq 'pid' ) ) {
-		push @cmd, '--history', '--skipdeleted';
-	}
+
 	my @out = get_cmd_output( @cmd );
 
 	push @playlist, "#EXTM3U\n";
@@ -1083,30 +869,18 @@ sub create_playlist_m3u_single {
 		# playlist with direct streaming for files through webserver
 		if ( $request eq 'playlistdirect' ) {
 			next if ! ( $pid && $type && $mode );
-			$url = build_url_direct( $request_host, $type, $pid, $mode, basename( $filename ), $opt->{STREAMTYPE}->{current}, $opt->{HISTORY}->{current}, $opt->{BITRATE}->{current}, $opt->{VSIZE}->{current}, $opt->{VFR}->{current} );
-
-		# If pid is actually a filename then use it cos this is a local file type programme
-		} elsif ( $request eq 'playlistfiles' && $pid =~ m{^/} ) {
-			next if ! $pid;
-			$url = search_absolute_path( $pid ) if $pid;
+			$url = build_url_direct( $request_host, $type, $pid, $mode, $outtype, $opt->{STREAMTYPE}->{current}, $opt->{HISTORY}->{current}, $opt->{BITRATE}->{current}, $opt->{VSIZE}->{current}, $opt->{VFR}->{current}, $opt->{VERSIONLIST}->{current} );
 
 		# playlist with local files
 		} elsif ( $request eq 'playlistfiles' ) {
 			next if ! $filename;
 			$url = search_absolute_path( $filename );
 
-		# playlist of proxied urls for streaming online prog via web server
-		} else {
-			next if ! ( $type && $pid );
-			my $suffix = "${pid}.${outtype}";
-			$url = build_url_stream( $request_host, $type, $pid, $mode || $modes, $suffix, $opt->{STREAMTYPE}->{current}, $opt->{BITRATE}->{current}, $opt->{VSIZE}->{current}, $opt->{VFR}->{current} );
 		}
 
-		# Format required, e.g.
-		##EXTINF:-1,BBC Radio - BBC Radio One (High Quality Stream)
 		push @playlist, "#EXTINF:-1,$type - $channel - $name - $episode - $desc";
 		push @playlist, "$url\n";
-		
+
 	}
 	print $se join ("\n", @playlist);
 	return join ("\n", @playlist);
@@ -1121,11 +895,6 @@ sub create_playlist_m3u_multi {
 
 	my @record = ( $cgi->param( 'PROGSELECT' ) );
 
-	# If a URL was specified by the User (assume auto mode list is OK):
-	if ( $opt->{URL}->{current} =~ m{^http://} ) {
-		push @record, "$opt->{PROGTYPES}->{current}|$opt->{URL}->{current}|$opt->{URL}->{current}|-";
-	}
-
 	# Create m3u from all selected 'TYPE|PID|NAME|EPISODE|MODE|CHANNEL' entries in the PVR
 	for (@record) {
 		my $url;
@@ -1135,39 +904,19 @@ sub create_playlist_m3u_multi {
 
 		# playlist with direct streaming fo files through webserver
 		if ( $request eq 'genplaylistdirect' ) {
-			$url = build_url_direct( $request_host, $type, $pid, $mode, $outtype, $opt->{STREAMTYPE}->{current}, $opt->{HISTORY}->{current}, $opt->{BITRATE}->{current}, $opt->{VSIZE}->{current}, $opt->{VFR}->{current} );
+			$url = build_url_direct( $request_host, $type, $pid, $mode, $outtype, $opt->{STREAMTYPE}->{current}, $opt->{HISTORY}->{current}, $opt->{BITRATE}->{current}, $opt->{VSIZE}->{current}, $opt->{VFR}->{current}, $opt->{VERSIONLIST}->{current} );
 
 		# playlist with local files
 		} elsif ( $request eq 'genplaylistfile' ) {
-			# If pid is actually a filename then use it cos this is a local file type programme
-			if ( $pid =~ m{^/} ) {
-				my $filename = search_absolute_path( $pid );
-				$url = $filename if $filename;
-			} else {
-				# Lookup filename (add it if defined - even if relative)
-				# check for -f $filename if you want to exclude files that cannot be found
-				my $filename = get_direct_filename( $pid, $mode, $type );
-				$url = $filename if $filename;
-			}
-
-		# Uncomment this to make all playlists local for localfiles types
-		# If pid is actually a filename then use it cos this is a local file type programme
-		#} elsif ( $pid =~ m{^/} ) {
-		#	my $filename = search_absolute_path( $pid );
-		#	$url = $filename if $filename;
-
-		# playlist of proxied urls for streaming online prog via web server
-		} else {
-			my $suffix = "${pid}.${outtype}";
-			$url = build_url_stream( $request_host, $type, $pid, $mode || $opt->{MODES}->{current}, $suffix, $opt->{STREAMTYPE}->{current}, $opt->{BITRATE}->{current}, $opt->{VSIZE}->{current}, $opt->{VFR}->{current} );
+			# Lookup filename (add it if defined - even if relative)
+			# check for -f $filename if you want to exclude files that cannot be found
+			my $filename = get_direct_filename( $pid, $mode, $type );
+			$url = $filename if -f $filename;
 		}
 
 		# Skip empty urls
 		next if ! $url;
-		
-		# Format required, e.g.
-		##EXTINF:-1,BBC Radio - BBC Radio One (High Quality Stream)
-		#http://localhost:1935/stream?PID=liveradio:bbc_radio_one&MODES=flashaac&OUTTYPE=bbc_radio_one.wav
+
 		push @playlist, "#EXTINF:-1,$type - $channel - $name - $episode";
 		push @playlist, "$url\n";
 
@@ -1178,139 +927,17 @@ sub create_playlist_m3u_multi {
 
 
 
-sub get_opml {
-	my ( $request_host, $outtype, $modes, $type, $bitrate, $search, $list ) = ( @_ );
-	my @playlist;
-	$outtype =~ s/^.*\.//g;
-
-	#<?xml version="1.0" encoding="UTF-8"?>
-	#<opml version="1.1">
-	#  <head>
-	#    <title>Grateful Dead - 1995-07-09-Chicago, IL</title>
-	#  </head>
-	#  <body>
-	#    <outline URL="http://www.archive.org/.../gd1995-07-09d1t01_vbr.mp3" bitrate="200" source="Soundboard" text="Touch Of Grey" type="audio" />
-	#    <outline URL="http://www.archive.org/.../gd1995-07-09d1t02_vbr.mp3" bitrate="203" source="Soundboard" text="Little Red Rooster" type="audio" />
-	#    <outline URL="http://www.archive.org/.../gd1995-07-09d1t03_vbr.mp3" bitrate="194" source="Soundboard" text="Lazy River Road" type="audio" />
-	#  </body>
-	#</opml>
-
-	print $se "INFO: Getting playlist for type '$type' using modes '$modes', bitrate '$bitrate', search='$search' and list '$list'\n";
-
-	# Header
-	push @playlist, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<opml version=\"1.1\">";
-
-	# Programmes
-	if (! $list) {
-
-		# Header
-		push @playlist, "\t<head>\n\t\t\n\t</head>";
-		push @playlist, "\t<body>";
-
-		# Extract and rewrite into playlist format
-		my @out = get_cmd_output(
-			$opt_cmdline->{getiplayer},
-			'--encoding-locale=UTF-8',
-			'--encoding-console-out=UTF-8',
-			'--nocopyright',
-			'--expiry=999999999',
-			'--webrequest',
-			get_iplayer_webrequest_args( 'nopurge=1', "type=$type", 'listformat=<pid>|<name>|<episode>|<desc>', "search=$search" ),
-		);
-		for ( grep !/^(Added:|Matches|$)/, @out ) {
-			chomp();
-			# Strip unprinatble chars
-			s/(.)/(ord($1) > 127) ? "" : $1/egs;
-			my ($pid, $name, $episode, $desc) = (split /\|/)[0,1,2,3];
-			next if ! ( $pid && $name );
-			push @playlist, "\t\t<outline URL=\"".encode_entities( build_url_stream( $request_host, $type, $pid, $modes, $outtype ) )."\"  bitrate=\"${bitrate}\" source=\"get_iplayer\" title=\"".encode_entities("$name - $episode - $desc")."\" text=\"".encode_entities("$name - $episode - $desc")."\" type=\"audio\" />";
-		}
-
-	# Top-level Menu
-	} elsif ( lc($list) eq 'menu' ) {
-		my %menu = (
-			'BBC Live Radio (National)' 	=> "${request_host}?ACTION=opml&PROGTYPES=liveradio&SEARCH=%20\\d&OUTTYPE=wav",
-			'BBC Live Radio (All)' 		=> "${request_host}?ACTION=opml&PROGTYPES=liveradio&OUTTYPE=wav",
-			'BBC iPlayer Radio Listen Again'=> "${request_host}?ACTION=opml&PROGTYPES=radio&LIST=channel",
-		);
-
-		# Header
-		push @playlist, "\t<head title=\"GetIplayer\">\n\t\t\n\t</head>";
-		push @playlist, "\t<body>";
-		for my $item ( sort keys %menu ) {
-			my $item_url = $menu{ $item };
-			#http://localhost:1935/opml?PROGTYPES=<type>SEARCH=bbc+radio+1&MODES=${modes}&OUTTYPE=a.wav
-			push @playlist, "\t\t<outline URL=\"".encode_entities( $item_url )."\" text=\"".encode_entities( "$item" )."\" />";
-		}
-		
-	# Channels/Names etc
-	} elsif ($list) {
-	
-		# Header
-		push @playlist, "\t<head>\n\t\t\n\t</head>";
-		push @playlist, "\t<body>";
-
-		# Extract and rewrite into playlist format
-		my @out = get_cmd_output(
-			$opt_cmdline->{getiplayer},
-			'--encoding-locale=UTF-8',
-			'--encoding-console-out=UTF-8',
-			'--nocopyright',
-			'--expiry=999999999',
-			'--webrequest',
-			get_iplayer_webrequest_args( 'nopurge=1', "type=$type", "list=$list", "channel=$search" ),
-		);
-		for ( grep !/^(Added:|Matches|$)/, @out ) {
-			my $suffix;
-			chomp();
-			# Strip unprinatble chars
-			s/(.)/(ord($1) > 127) ? "" : $1/egs;
-			next if ! m{^.+\(\d+\)$};
-			my $item = $_;
-			s/\s*\(\d+\)$//g;
-			my $itemregex = '^'.$_.'$';
-			# URL encode it
-			$itemregex =~ s/([^A-Za-z0-9])/sprintf("%%%02X", ord($1))/seg;
-			# Stateful addition of search terms
-			$suffix = '&LIST=name' if $list eq 'channel';
-			# Format required, e.g.
-			#http://localhost:1935/opml?PROGTYPES=<type>SEARCH=bbc+radio+1&MODES=${modes}&OUTTYPE=a.wav
-			push @playlist, "\t\t<outline URL=\"".encode_entities("${request_host}?ACTION=opml&PROGTYPES=${type}&SEARCH=${itemregex}${suffix}&MODES=${modes}&OUTTYPE=a.wav")."\" text=\"".encode_entities("$item")."\" title=\"".encode_entities("$item")."\" type=\"playlist\" />";
-		}
-
-	}
-
-	# Footer
-	push @playlist, "\t</body>\n</opml>";
-
-	return join ("\n", @playlist);
-}
-
-
-
 ### Playlist URL builders
 sub build_url_direct {
-	my ( $request_host, $progtypes, $pid, $modes, $outtype, $streamtype, $history, $bitrate, $vsize, $vfr ) = ( @_ );
+	my ( $request_host, $progtypes, $pid, $modes, $outtype, $streamtype, $history, $bitrate, $vsize, $vfr, $versionlist, $action ) = ( @_ );
 	# Sanity check
 	#print $se "DEBUG: building direct playback request using:  PROGTYPES=${progtypes}  PID=${pid}  MODES=${modes}  OUTTYPE=${outtype}\n";
 	# CGI::escape
 	$_ = CGI::escape($_) for ( $progtypes, $pid, $modes, $outtype, $streamtype, $history, $bitrate, $vsize );
 	#print $se "DEBUG: building direct playback request using:  PROGTYPES=${progtypes}  PID=${pid}  MODES=${modes}  OUTTYPE=${outtype}  BITRATE=${bitrate}  VSIZE=${vsize}  VFR=${vfr}\n";
 	# Build URL
-	return "${request_host}?ACTION=direct&PROGTYPES=${progtypes}&PID=${pid}&MODES=${modes}&HISTORY=${history}&OUTTYPE=${outtype}&STREAMTYPE=${streamtype}&BITRATE=${bitrate}&VSIZE=${vsize}&VFR=${vfr}";
-}
-
-
-# "${request_host}?ACTION=stream&PROGTYPES=${type}&PID=${pid}&MODES=${modes}&OUTTYPE=${suffix}";
-sub build_url_stream {
-	my ( $request_host, $progtypes, $pid, $modes, $outtype, $streamtype, $bitrate, $vsize, $vfr ) = ( @_ );
-	# Sanity check
-	#print $se "DEBUG: building stream playback request using:  PROGTYPES=${progtypes}  PID=${pid}  MODES=${modes}  OUTTYPE=${outtype}\n";
-	# CGI::escape
-	$_ = CGI::escape($_) for ( $progtypes, $pid, $modes, $outtype, $streamtype, $bitrate, $vsize, $vfr );
-	#print $se "DEBUG: building stream playback request using:  PROGTYPES=${progtypes}  PID=${pid}  MODES=${modes}  OUTTYPE=${outtype}\n";
-	# Build URL
-	return "${request_host}?ACTION=stream&PROGTYPES=${progtypes}&PID=${pid}&MODES=${modes}&OUTTYPE=${outtype}&STREAMTYPE=${streamtype}&BITRATE=${bitrate}&VSIZE=${vsize}&VFR=${vfr}";
+	$action ||= 'direct';
+	return "${request_host}?ACTION=$action&PROGTYPES=${progtypes}&PID=${pid}&MODES=${modes}&HISTORY=${history}&OUTTYPE=${outtype}&STREAMTYPE=${streamtype}&BITRATE=${bitrate}&VSIZE=${vsize}&VFR=${vfr}&VERSIONLIST=${versionlist}";
 }
 
 
@@ -1320,87 +947,15 @@ sub build_url_stream {
 ## 'PlayWeb' - not on vlc
 # Play from file on web server/'PlayWeb' ?ACTION=playlistdirect	&SEARCHFIELDS=pid	&SEARCH=$pid	&MODES=${modes}
 sub build_url_playlist {
-	my ( $request_host, $action, $searchfields, $search, $modes, $progtypes, $outtype, $streamtype, $bitrate, $vsize, $vfr ) = ( @_ );
+	my ( $request_host, $action, $searchfields, $search, $modes, $progtypes, $outtype, $streamtype, $bitrate, $vsize, $vfr, $versionlist ) = ( @_ );
 	# Sanity check
 	#print $se "DEBUG: building $action request using:  SEARCHFIELDS=${searchfields}  SEARCH=${search}  MODES=${modes}  PROGTYPES=${progtypes}  OUTTYPE=${outtype}\n";
 	# CGI::escape
 	$_ = CGI::escape($_) for ( $action, $searchfields, $search, $modes, $progtypes, $outtype, $streamtype, $bitrate, $vsize, $vfr );
 	#print $se "DEBUG: building $action request using:  SEARCHFIELDS=${searchfields}  SEARCH=${search}  MODES=${modes}  PROGTYPES=${progtypes}  OUTTYPE=${outtype}\n";
 	# Build URL
-	return "${request_host}?ACTION=${action}&SEARCHFIELDS=${searchfields}&SEARCH=${search}&MODES=${modes}&PROGTYPES=${progtypes}&OUTTYPE=${outtype}&STREAMTYPE=${streamtype}&BITRATE=${bitrate}&VSIZE=${vsize}&VFR=${vfr}";
+	return "${request_host}?ACTION=${action}&SEARCHFIELDS=${searchfields}&SEARCH=${search}&MODES=${modes}&PROGTYPES=${progtypes}&OUTTYPE=${outtype}&STREAMTYPE=${streamtype}&BITRATE=${bitrate}&VSIZE=${vsize}&VFR=${vfr}&VERSIONLIST=${versionlist}";
 }
-
-
-
-# Update script
-# Generic
-# Updates and overwrites this script - makes backup as <this file>.old
-# Update logic:
-# If the get_iplayer.cgi script is unwritable then quit
-# update script
-sub update_script {
-	my $update_url	= 'http://www.infradead.org/get_iplayer/latest/get_iplayer.cgi';
-	# Get version URL
-	my $script_file = $0;
-	my $ua = create_ua('update');
-
-	# If the get_iplayer script is unwritable then quit - makes it harder for deb/rpm installed scripts to be overwritten
-	if ( ! -w $script_file ) {
-		print $se "ERROR: $script_file is not writable - aborting update\n";
-		exit 1;
-	}
-
-	print $se "INFO: Updating $script_file (from $VERSION)\n";
-	print $fh p("Updating $script_file (from $VERSION)");
-	if ( update_file( $ua, $update_url, $script_file ) ) {
-		print $fh p("Updating Web PVR Manager Failed");
-	} else {
-		print $fh p("Updating Web PVR Manager Succeeded - please restart the get_iplayer Web PVR Manager service");
-	}
-
-	print $se "INFO: Updating get_iplayer\n";
-	my @cmd = (
-		$opt_cmdline->{getiplayer},
-		'--encoding-locale=UTF-8',
-		'--encoding-console-out=UTF-8',
-		'--nocopyright',
-		'--expiry=999999999',
-		'--nopurge',
-		'--update',
-	);
-	print $fh '<pre>';
-	run_cmd( $fh, $se, 1, @cmd );
-	print $fh '</pre>';
-	print $fh p("Updated get_iplayer");
-
-	# Render options actions
-	print $fh div( { -class=>'action' },
-		ul( { -class=>'action' },
-			li( { -class=>'action' }, [
-				a(
-					{
-						-class=>'action',
-						-title => 'Go Back',
-						-onClick  => "history.back()",
-					},
-					'Back'
-				),
-			]),
-		),
-	);
-
-	return 0;
-}
-
-
-
-sub create_ua {
-	my $ua = LWP::UserAgent->new;
-	$ua->timeout( 10 );
-	$ua->agent( "get_iplayer Web PVR Manager updater version $VERSION" );
-	$ua->conn_cache(LWP::ConnCache->new());
-	return $ua;
-};	
 
 
 
@@ -1412,12 +967,12 @@ sub request_url_retry {
 	my %OPTS = @LWP::Protocol::http::EXTRA_SOCK_OPTS;
 	$OPTS{SendTE} = 0;
 	@LWP::Protocol::http::EXTRA_SOCK_OPTS = %OPTS;
-	
+
 	my ($ua, $url, $retries, $succeedmsg, $failmsg) = @_;
 	my $res;
 
 	# Malformed URL check
-	if ( $url !~ m{^\s*http\:\/\/}i ) {
+	if ( $url !~ m{^\s*https?\:\/\/}i ) {
 		print $se "ERROR: Malformed URL: '$url'\n";
 		return '';
 	}
@@ -1441,42 +996,6 @@ sub request_url_retry {
 
 
 
-# Updates a file:
-# Usage: update_file( <ua>, <url>, <dest filename> )
-sub update_file {
-	my $ua = shift;
-	my $url = shift;
-	my $dest_file = shift;
-	my $res;
-	# Download the file
-	if ( not $res = request_url_retry($ua, $url, 3) ) {
-		print $se "ERROR: Could not download update for ${dest_file} - Update aborted\n";
-		return 1;
-	}
-	# If the download was successful then copy over this file and make executable after making a backup of this script
-	if ( -f $dest_file ) {
-		if ( ! copy($dest_file, $dest_file.'.old') ) {
-			print $se "ERROR: Could not create backup file ${dest_file}.old - Update aborted\n";
-			return 1;
-		}
-	}
-	# Check if file is writable
-	if ( not open( FILE, "> $dest_file" ) ) {
-		print $se "ERROR: $dest_file is not writable by the current user - Update aborted\n";
-		return 1;
-	}
-	# Windows needs this
-	binmode FILE;
-	# Write contents to file
-	print FILE $res;
-	close FILE;
-	chmod 0755, $dest_file;
-	print $se "INFO: Downloaded $dest_file\n";
-	return 0;
-}
-
-
-
 # Invokes command in @args as a system call (hopefully) without using a shell
 #  Can also redirect all stdout and stderr to either: STDOUT, STDERR or unchanged
 # Usage: run_cmd( <''|STDOUTFH>, <''|STDERRFH>, @args )
@@ -1491,25 +1010,14 @@ sub run_cmd_unix {
 
 	print $se "INFO: Command: ".(join ' ', @cmd)."\n"; # if $opt->{verbose};
 
-	# Check if we have IPC::Open3 otherwise fallback on system()
-	eval "use IPC::Open3";
-	
-	# probably only likely in win32
-	if ($@) {
-		print $se "ERROR: Please download and run latest installer - 'IPC::Open3' is not available\n";
-		exit 1;
+	#print $se "INFO: open3( 0, \">&".fileno($fh_child_out).", \">&".fileno($fh_child_err).", <cmd> )\n";
+	# Don't use NULL for the 1st arg of open3 otherwise we end up with a messed up STDIN once it returns
+	my $procid = open3( 0, ">&".fileno($fh_child_out), ">&".fileno($fh_child_err), @cmd );
+	# Wait for child to complete
+	waitpid( $procid, 0 );
+	$rtn = $?;
 
-	# Use open3()
-	} else {
-		#print $se "INFO: open3( 0, \">&".fileno($fh_child_out).", \">&".fileno($fh_child_err).", <cmd> )\n";
-		# Don't use NULL for the 1st arg of open3 otherwise we end up with a messed up STDIN once it returns
-		my $procid = open3( 0, ">&".fileno($fh_child_out), ">&".fileno($fh_child_err), @cmd );
-		# Wait for child to complete
-		waitpid( $procid, 0 );
-		$rtn = $?;
-	}
-
-	# Interpret return code	      
+	# Interpret return code
 	return interpret_return_code( $rtn );
 }
 
@@ -1534,152 +1042,147 @@ sub run_cmd {
 	my $err = new IO::Handle;
 	my @cmd = ( @_ );
 	my $direct = grep(/$opt_cmdline->{ffmpeg}/, @cmd);
-	my $stream = grep(/stream%3D1/, @cmd);
-	my $livetv = grep(/type%3Dlivetv/, @cmd);
-	my $filter_ffmpeg_progress = (! $stream && $livetv);
-	my $stdout_raw = ($direct || $stream);
+	my $is_hls = grep(/modes%3Dhl(s|x)/, @cmd);
+	my $stdout_raw = $direct;
 	my $rtn;
 
 	$fh_cmd_out->autoflush(1);
 	$fh_cmd_err->autoflush(1);
-	
+
 	print $se "INFO: Command: ".(join ' ', @cmd)."\n"; # if $opt->{verbose};
 
-	# Check if we have IPC::Open3 otherwise fallback on system()
-	eval "use IPC::Open3";
-	
-	# probably only likely in win32
-	if ($@) {
-		print $se "ERROR: Please download and run latest installer - 'IPC::Open3' is not available\n";
-		exit 1;
-
-	# Use open3()
-	} else {
-		my $procid;
-		# Setup signal handlers so that when the browser is closed the SIGPIPE results in sending a SIGTERM to the forked command.
-		local $SIG{PIPE} = sub {
-			my $signal = shift;
-			print $se "\nINFO: $$ Cleaning up (signal = $signal), killing cmd PID=$procid:\n";
-			for my $sig ( qw/INT PIPE TERM KILL/ ) {
-				# Kill process with SIGs
-				print $se "INFO: $$ killing cmd PID=$procid with SIG${sig}\n";
-				kill $sig, $procid;
-				sleep 1;
-				if ( ! kill 0, $procid ) {
-					print $se "INFO: $$ killed cmd PID=$procid\n";
-					last;
-				}
-				sleep 4;
+	my $procid;
+	# Setup signal handlers so that when the browser is closed the SIGPIPE results in sending a SIGTERM to the forked command.
+	local $SIG{PIPE} = sub {
+		my $signal = shift;
+		print $se "\nINFO: $$ Cleaning up (signal = $signal), killing cmd PID=$procid:\n";
+		for my $sig ( qw/INT PIPE TERM KILL/ ) {
+			# Kill process with SIGs
+			print $se "INFO: $$ killing cmd PID=$procid with SIG${sig}\n";
+			kill $sig, $procid;
+			sleep 1;
+			if ( ! kill 0, $procid ) {
+				print $se "INFO: $$ killed cmd PID=$procid\n";
+				last;
 			}
-			exit 0;
-		};
+			sleep 4;
+		}
+		exit 0;
+	};
 
-		# Don't use NULL for the 1st arg of open3 otherwise we end up with a messed up STDIN once it returns
-		$procid = open3( gensym, $from, $err, @cmd ) || print $se "ERROR: Could not execute command: $!\n";
+	# Don't use NULL for the 1st arg of open3 otherwise we end up with a messed up STDIN once it returns
+	$procid = open3( gensym, $from, $err, @cmd ) || print $se "ERROR: Could not execute command: $!\n";
 
-		my $childpidout = fork();
+	my $childpidout = fork();
 
-		# Fork a child process to read from the indirect (STDOUT) fh of the spawned command and write it to the selected fh (browser client)
-		if ( $childpidout <= 0 ) {
-			# Not sure if these are necessary:
-			$fh_cmd_out->autoflush(1);
-			$from->autoflush(1);
-			if ( $stdout_raw)  {
-				binmode $from, ':raw';
+	# Fork a child process to read from the indirect (STDOUT) fh of the spawned command and write it to the selected fh (browser client)
+	if ( $childpidout <= 0 ) {
+		# Not sure if these are necessary:
+		$fh_cmd_out->autoflush(1);
+		$from->autoflush(1);
+		if ( $stdout_raw)  {
+			binmode $from, ':raw';
+		} else {
+			binmode $from, ':utf8';
+		}
+		# Read each char from command output and push to socket fh
+		my $char;
+		my $bytes;
+		while ( $bytes = read( $from, $char, $size ) ) {
+			if ( $bytes <= 0 ) {
+				print $se "DEBUG: STDOUT fd closed - exiting thread\n";
+				exit 0;
 			} else {
-				binmode $from, ':utf8';
+				print $fh_cmd_out $char;
 			}
-			# Read each char from command output and push to socket fh
-			my $char;
-			my $bytes;
-			while ( $bytes = read( $from, $char, $size ) ) {
+			last if $bytes < $size;
+		}
+		#print $se "CMD STDOUT FH EMPTY\n";
+		exit 0;
+	# Parent continues here
+	} elsif ( defined $childpidout ) {
+		print $se "DEBUG: Forked STDOUT reader with PID $childpidout\n";
+	# Failed to fork
+	} else {
+		print $se "ERROR: Failed to fork STDOUT reader process: $!\n";
+		exit 1;
+	}
+
+	my $childpiderr = fork();
+
+	# Fork a child process to read from the indirect (STDERR) fh of the spawned command and write it to the selected fh (browser client)
+	if ( $childpiderr <= 0 ) {
+		# Not sure if these are necessary:
+		$fh_cmd_err->autoflush(1);
+		$err->autoflush(1);
+		binmode $err, ':utf8';
+		# Read each char from command output and push to socket fh
+		my $char;
+		my $bytes;
+		# Assume that we don't want to buffer STDERR output of the command
+		$size = 1;
+		if ( $is_hls ) {
+			my ($count, $buf);
+			while ( $bytes = read( $err, $char, $size ) ) {
 				if ( $bytes <= 0 ) {
-					print $se "DEBUG: STDOUT fd closed - exiting thread\n";
+					print $se "DEBUG: STDERR fd closed - exiting thread\n";
 					exit 0;
 				} else {
-					print $fh_cmd_out $char;
+					if ( $char eq "#" ) {
+						print $fh_cmd_err $char;
+					} elsif ( $char =~ /[\r\n]/ ) {
+						if ( $buf =~ /size=/ ) {
+							$count++;
+							print $fh_cmd_err "#";
+							print $fh_cmd_err "\n" if ! ($count % 100);
+						} else {
+							print $fh_cmd_err $buf;
+							print $fh_cmd_err "\n";
+						}
+						$buf = '';
+					} else {
+						$buf .= $char;
+					}
+				}
+				if ( $bytes < $size ) {
+					print $fh_cmd_err "$buf\n" if $buf;
+					last;
+				}
+			}
+		} else {
+			while ( $bytes = read( $err, $char, $size ) ) {
+				if ( $bytes <= 0 ) {
+					print $se "DEBUG: STDERR fd closed - exiting thread\n";
+					exit 0;
+				} else {
+					print $fh_cmd_err $char;
 				}
 				last if $bytes < $size;
 			}
-			#print $se "CMD STDOUT FH EMPTY\n";
-			exit 0;
-		# Parent continues here
-		} elsif ( defined $childpidout ) {
-			print $se "DEBUG: Forked STDOUT reader with PID $childpidout\n";
-		# Failed to fork
-		} else {
-			print $se "ERROR: Failed to fork STDOUT reader process: $!\n";
-			exit 1;
 		}
-		
-		my $childpiderr = fork();
-
-		# Fork a child process to read from the indirect (STDERR) fh of the spawned command and write it to the selected fh (browser client)
-		if ( $childpiderr <= 0 ) {
-			# Not sure if these are necessary:
-			$fh_cmd_err->autoflush(1);
-			$err->autoflush(1);
-			binmode $err, ':utf8';
-			# Read each char from command output and push to socket fh
-			my $char;
-			my $bytes;
-			# Assume that we don't want to buffer STDERR output of the command
-			$size = 1;
-			if ( $filter_ffmpeg_progress) {
-				my ($count, $buf);
-				while ( $bytes = read( $err, $char, $size ) ) {
-					if ( $bytes <= 0 ) {
-						print $se "DEBUG: STDERR fd closed - exiting thread\n";
-						exit 0;
-					} else {
-						if ( $char =~ /[\r\n]/ ) {
-							if ( $buf =~ /size=/ ) {
-								print $fh_cmd_err "$buf\n" if ! ($count++ % 10);
-							} else {
-								print $fh_cmd_err "$buf\n";
-							}
-							$buf = '';
-						} else {
-							$buf .= $char;
-						}
-					}
-					last if $bytes < $size;
-				}
-			} else {
-				while ( $bytes = read( $err, $char, $size ) ) {
-					if ( $bytes <= 0 ) {
-						print $se "DEBUG: STDERR fd closed - exiting thread\n";
-						exit 0;
-					} else {
-						print $fh_cmd_err $char;
-					}
-					last if $bytes < $size;
-				}
-			}
-			#print $se "CMD STDERR FH EMPTY\n";
-			exit 0;
-		# Parent continues here
-		} elsif ( defined $childpiderr ) {
-			print $se "DEBUG: Forked STDERR reader with PID $childpiderr\n";
-		# Failed to fork
-		} else {
-			print $se "ERROR: Failed to fork STDERR reader process: $!\n";
-			exit 1;
-		}
-
-		# Reap reader processes
-		waitpid( $childpidout, 0 );
-		waitpid( $childpiderr, 0 );
-
-		# Reap command child
-		waitpid( $procid, 0 );
-		$rtn = $?;
-
-		# Restore sigpipe handler for reader and writer processes
-		$SIG{PIPE} = 'DEFAULT';
+		#print $se "CMD STDERR FH EMPTY\n";
+		exit 0;
+	# Parent continues here
+	} elsif ( defined $childpiderr ) {
+		print $se "DEBUG: Forked STDERR reader with PID $childpiderr\n";
+	# Failed to fork
+	} else {
+		print $se "ERROR: Failed to fork STDERR reader process: $!\n";
+		exit 1;
 	}
 
-	# Interpret return code	      
+	# Reap reader processes
+	waitpid( $childpidout, 0 );
+	waitpid( $childpiderr, 0 );
+
+	# Reap command child
+	waitpid( $procid, 0 );
+	$rtn = $?;
+
+	# Restore sigpipe handler for reader and writer processes
+	$SIG{PIPE} = 'DEFAULT';
+
+	# Interpret return code
 	return interpret_return_code( $rtn );
 }
 
@@ -1709,7 +1212,7 @@ sub run_cmd_win32 {
 
 	$rtn = system( @cmd );
 
-	# Interpret return code	      
+	# Interpret return code
 	return interpret_return_code( $rtn );
 }
 
@@ -1775,75 +1278,64 @@ sub get_cmd_output {
 	#$to->autoflush(1);
 	$from->autoflush(1);
 	$error->autoflush(1);
-	
+
 	print $se "INFO: Command: ".(join ' ', @cmd)."\n"; # if $opt->{verbose};
 
-	# Check if we have IPC::Open3 otherwise fallback on system()
-	eval "use IPC::Open3";
-
-	# probably only likely in win32
-	if ($@) {
-		print $se "ERROR: Please download and run latest installer - 'IPC::Open3' is not available\n";
-		exit 1;
-
-	# Use open3()
-	} else {
-		my $procid;
-		# Setup signal handlers so that when the browser is closed the SIGPIPE results in sending a SIGTERM to the forked command.
-		local $SIG{PIPE} = sub {
-			my $signal = shift;
-			print $se "\nINFO: $$ Cleaning up (signal = $signal), killing cmd PID=$procid:\n";
-			for my $sig ( qw/INT PIPE TERM KILL/ ) {
-				# Kill process with SIGs
-				print $se "INFO: $$ killing cmd PID=$procid with SIG${sig}\n";
-				kill $sig, $procid;
-				sleep 1;
-				if ( ! kill 0, $procid ) {
-					print $se "INFO: $$ killed cmd PID=$procid\n";
-					last;
-				}
-				sleep 4;
+	my $procid;
+	# Setup signal handlers so that when the browser is closed the SIGPIPE results in sending a SIGTERM to the forked command.
+	local $SIG{PIPE} = sub {
+		my $signal = shift;
+		print $se "\nINFO: $$ Cleaning up (signal = $signal), killing cmd PID=$procid:\n";
+		for my $sig ( qw/INT PIPE TERM KILL/ ) {
+			# Kill process with SIGs
+			print $se "INFO: $$ killing cmd PID=$procid with SIG${sig}\n";
+			kill $sig, $procid;
+			sleep 1;
+			if ( ! kill 0, $procid ) {
+				print $se "INFO: $$ killed cmd PID=$procid\n";
+				last;
 			}
-			exit 0;
-		};
-
-		#print $se "INFO: open3( 0, \">&".fileno($fh_child_out).", \">&".fileno($fh_child_err).", <cmd> )\n";
-		# Don't use NULL for the 1st arg of open3 otherwise we end up with a messed up STDIN once it returns
-		$procid = open3( gensym, $from, $error, @cmd );
-		# Wait for child to complete
-
-		my $childpid = fork();
-		binmode $se, IS_WIN32 ? ":encoding(cp1252)" : ':encoding(UTF-8)';
-		# Child
-		if ( $childpid == 0 ) {
-			binmode $error, ':utf8';
-			while ( <$error> ) {
-				print $se "CMD STDERR: $_";
-			}
-			#print $se "CMD STDERR EMPTY\n";
-			exit 0;
-		# Parent
-		} elsif ( defined $childpid ) {
-			binmode $from, ':utf8';
-			while ( <$from> ) {
-				push @out_from, $_;
-			}
-		} else {
-			print $se "ERROR: Could not fork STDERR reader process\n";
-			exit 1;
+			sleep 4;
 		}
-		waitpid( $childpid, 0 );
+		exit 0;
+	};
 
-		waitpid( $procid, 0 );
-		$rtn = $?;
+	#print $se "INFO: open3( 0, \">&".fileno($fh_child_out).", \">&".fileno($fh_child_err).", <cmd> )\n";
+	# Don't use NULL for the 1st arg of open3 otherwise we end up with a messed up STDIN once it returns
+	$procid = open3( gensym, $from, $error, @cmd );
+	# Wait for child to complete
 
-		# Restore sigpipe handler for reader and writer processes
-		$SIG{PIPE} = 'DEFAULT';
+	my $childpid = fork();
+	binmode $se, IS_WIN32 ? ":encoding(cp1252)" : ':encoding(UTF-8)';
+	# Child
+	if ( $childpid == 0 ) {
+		binmode $error, ':utf8';
+		while ( <$error> ) {
+			print $se "CMD STDERR: $_";
+		}
+		#print $se "CMD STDERR EMPTY\n";
+		exit 0;
+	# Parent
+	} elsif ( defined $childpid ) {
+		binmode $from, ':utf8';
+		while ( <$from> ) {
+			push @out_from, $_;
+		}
+	} else {
+		print $se "ERROR: Could not fork STDERR reader process\n";
+		exit 1;
 	}
+	waitpid( $childpid, 0 );
 
-	# Interpret return code	      
+	waitpid( $procid, 0 );
+	$rtn = $?;
+
+	# Restore sigpipe handler for reader and writer processes
+	$SIG{PIPE} = 'DEFAULT';
+
+	# Interpret return code
 	interpret_return_code( $rtn );
-	
+
 	return @out_from;
 }
 
@@ -1864,7 +1356,7 @@ sub get_cmd_output_win32 {
 	my @out = <CMD>;
 	close CMD;
 
-	# Interpret return code	      
+	# Interpret return code
 	interpret_return_code( $? );
 
 	return @out;
@@ -1874,7 +1366,7 @@ sub get_cmd_output_win32 {
 
 sub interpret_return_code {
 	my $rtn = shift;
-	# Interpret return code	and force return code 2 upon error      
+	# Interpret return code and force return code 2 upon error
 	my $return = $rtn >> 8;
 	if ( $rtn == -1 && $IGNOREEXIT ) {
 		$return = 0;
@@ -1962,30 +1454,30 @@ sub show_pvr_list {
 					{
 						-class => 'action',
 						-title => 'Delete selected programmes from PVR search list',
-						-onClick => "if(! check_if_selected(document.form, 'PVRSELECT')) { alert('No programmes were selected'); return false; } BackupFormVars(form); form.NEXTPAGE.value='pvr_del'; form.submit(); RestoreFormVars(form);",
+						-onClick => "if(! check_if_selected(document.form1, 'PVRSELECT')) { alert('No programmes were selected'); return false; } BackupFormVars(form1); form1.NEXTPAGE.value='pvr_del'; form1.submit(); RestoreFormVars(form1);",
 					},
 					'Delete'
 				),
 			]),
 		),
 	);
-	
+
 	my @html;
 	my @displaycols = ( 'pvrsearch', ( grep !/pvrsearch/, ( sort keys %fields ) ) );
 	# Build header row
 	push @html, "<tr class=\"search\" >";
-	push @html, th( { -class => 'search' }, checkbox( -class=>'search', -title=>'Select/Unselect All PVR Searches', -onClick=>"check_toggle(document.form, 'PVRSELECT')", -name=>'SELECTOR', -value=>'1', -label=>'' ) );
+	push @html, th( { -class => 'search' }, checkbox( -class=>'search', -title=>'Select/Unselect All PVR Searches', -onClick=>"check_toggle(document.form1, 'PVRSELECT')", -name=>'SELECTOR', -value=>'1', -label=>'' ) );
 	# Display data in nested table
 	for my $heading (@displaycols) {
 
-	        # Sort by column click and change display class (colour) according to sort status
-	        my ($title, $class, $onclick);
-	        if ( $sort_field eq $heading && not $reverse ) {
-                  ($title, $class, $onclick) = ("Sort by Reverse $fieldname{$heading}", 'sorted pointer', "BackupFormVars(form); form.NEXTPAGE.value='pvr_list'; form.PVRSORT.value='$heading'; form.PVRREVERSE.value=1; form.submit(); RestoreFormVars(form);");
-                } else {
-                  ($title, $class, $onclick) = ("Sort by $fieldname{$heading}", 'unsorted pointer', "BackupFormVars(form); form.NEXTPAGE.value='pvr_list'; form.PVRSORT.value='$heading'; form.submit(); RestoreFormVars(form); ");
-                }
-                $class = 'sorted_reverse pointer' if $sort_field eq $heading && $reverse;
+		# Sort by column click and change display class (colour) according to sort status
+		my ($title, $class, $onclick);
+		if ( $sort_field eq $heading && not $reverse ) {
+			($title, $class, $onclick) = ("Sort by Reverse $fieldname{$heading}", 'sorted pointer', "BackupFormVars(form1); form1.NEXTPAGE.value='pvr_list'; form1.PVRSORT.value='$heading'; form1.PVRREVERSE.value=1; form1.submit(); RestoreFormVars(form1);");
+		} else {
+			($title, $class, $onclick) = ("Sort by $fieldname{$heading}", 'unsorted pointer', "BackupFormVars(form1); form1.NEXTPAGE.value='pvr_list'; form1.PVRSORT.value='$heading'; form1.submit(); RestoreFormVars(form1); ");
+		}
+		$class = 'sorted_reverse pointer' if $sort_field eq $heading && $reverse;
 
 		push @html, th( { -class => 'search' },
 			label( {
@@ -1995,8 +1487,8 @@ sub show_pvr_list {
 				},
 				$fieldname{$heading} || $heading,
 			)
-                );
-        }
+		);
+	}
 	push @html, "</tr>";
 
 	# Build each row
@@ -2013,11 +1505,11 @@ sub show_pvr_list {
 			)
 		);
 		for ( @displaycols ) {
-			push @row, td( {-class=>'search'}, 
+			push @row, td( {-class=>'search'},
 				label( {
 					-title		=> "Click to Edit",
 					-class		=> 'search',
-					-onClick	=> "BackupFormVars(form); form.NEXTPAGE.value='pvr_edit'; form.PVRSEARCH.value='$name'; form.submit(); RestoreFormVars(form);",
+					-onClick	=> "BackupFormVars(form1); form1.NEXTPAGE.value='pvr_edit'; form1.PVRSEARCH.value='$name'; form1.submit(); RestoreFormVars(form1);",
 					},
 					$pvrsearch->{$name}->{$_},
 				)
@@ -2026,10 +1518,10 @@ sub show_pvr_list {
 		push @html, Tr( {-class=>'search'}, @row );
 	}
 
-	
+
 	# Search form
 	print $fh start_form(
-		-name   => "form",
+		-name   => "form1",
 		-method => "POST",
 	);
 	print $fh p("Click to Edit any PVR Search");
@@ -2105,7 +1597,7 @@ sub pvr_edit {
 
 	# Editing form
 	print $fh start_form(
-		-name   => "form",
+		-name   => "form1",
 		-method => "POST",
 	);
 
@@ -2127,7 +1619,7 @@ sub pvr_edit {
 					{
 						-class => 'action',
 						-title => 'Save changes',
-						-onClick => "BackupFormVars(form); form.NEXTPAGE.value='pvr_save'; form.submit(); RestoreFormVars(form);",
+						-onClick => "BackupFormVars(form1); form1.NEXTPAGE.value='pvr_save'; form1.submit(); RestoreFormVars(form1);",
 					},
 					'Save Changes'
 				),
@@ -2168,6 +1660,7 @@ sub get_sorted {
 		timeadded	=> 'numeric',
 		seriesnum	=> 'numeric',
 		episodenum	=> 'numeric',
+		expires	=> 'numeric',
 	);
 
 	# Insert search '<key>~~~<sort_field>' for each prog in hash
@@ -2191,7 +1684,7 @@ sub get_sorted {
 			@sorted = sort { lc $a cmp lc $b } @unsorted;
 		}
 	}
-	# Strip off seach key at beginning of each line
+	# Strip off search key at beginning of each line
 	s/^.*~~~// for @sorted;
 
 	return @sorted;
@@ -2258,11 +1751,12 @@ sub show_info {
 		$out .= "$key: $val\n";
 		$prog{$pid}->{$key} = $val;
 		# Make into a link if this value is a URL
-		$val = a( { -class=>'info', -title=>'Open URL', -href=>$val }, $val ) if $val =~ m{^http://.+};
+		$val = a( { -class=>'info', -title=>'Open URL', -href=>$val, -target=>'_new' }, $val ) if $val =~ m{^https?://.+};
 		push @html, Tr( { -class => 'info' }, th( { -class => 'info' }, $key ).td( { -class => 'info' }, $val ) );
 	}
 	# Show thumb if one exists
-	print $fh img( { -class=>'action', -src=>$prog{$pid}->{thumbnail} } ) if $prog{$pid}->{thumbnail};
+	$prog{$pid}->{thumbnail} ||= DEFAULT_THUMBNAIL;
+	print $fh img( { -height=>216, -class=>'action', -src=>$prog{$pid}->{thumbnail} } ) if $prog{$pid}->{thumbnail};
 	# Set optional output dir for pvr queue if set
 	my $outdir;
 	$outdir = '&OUTPUT='.CGI::escape("$opt->{OUTPUT}->{current}") if $opt->{OUTPUT}->{current};
@@ -2278,14 +1772,6 @@ sub show_info {
 					},
 					'Close'
 				),
-				a(
-					{
-						-class => 'action',
-						-title => "Play '$prog{$pid}->{name} - $prog{$pid}->{episode}' Now",
-						-href => build_url_playlist( '', 'playlist', 'pid', $pid, $prog{$pid}->{mode} || $default_modes, $prog{$pid}->{type}, $cgi->param( 'OUTTYPE' ) || 'out.flv', $cgi->param( 'STREAMTYPE' ), $cgi->param( 'BITRATE' ), $cgi->param( 'VSIZE' ), $cgi->param( 'VFR' ) ),
-					},
-					'Play'
-				),
 			]),
 		),
 	);
@@ -2299,33 +1785,14 @@ sub show_info {
 # If the PID is a filename then filename is still searched using PID and TYPE
 sub get_direct_filename {
 	my ( $pid, $mode, $type ) = ( @_ );
-	my $out;
-	my @html;
-	my %prog;
-	my $pidisfile;
 	my $history = 1;
 
 	print $se "DEBUG: Looking up filename for MODE=$mode TYPE=$type PID=$pid\n";
-	
-	# set this flag if required and unset history if pid is a file
-	if ( -f $pid ) {
-		print $se "DEBUG: PID is a valid filename\n";
-		$pidisfile = 1;
-		$history = 0;
-	}
 
-	# Skip if not defined or, if pid is a file and no type defined
-	if ( $pidisfile && ! $type ) {
-		print $se "ERROR: Cannot lookup filename for PID which is a filename if type is not set\n";
-		return '';
-	}
-	if ( ( ! $pidisfile ) && ! ( $pid && $mode && $type ) ) {
+	if ( ! ( $pid && $mode && $type ) ) {
 		print $se "ERROR: Cannot lookup filename unless PID, MODE and TYPE are set\n";
 		return '';
 	}
-
-	# make the pid regex friendly
-	$pid =~ s|([\/\.\?\+\-\*\^\(\)\[\]\{\}])|\\$1|g;
 
 	# Get the 'filename' entry from --history --info for this pid
 	my @cmd = (
@@ -2344,13 +1811,9 @@ sub get_direct_filename {
 	# Extract the filename
 	my $match = ( grep /^filename:/, @cmdout )[0];
 	my $filename;
-	if ( $pidisfile ) {
-		$filename = $1 if $match =~ m{^filename: (\/.+?)\|<filename>\|<mode>\s*$};
-	} else {
-		$filename = $1 if $match =~ m{^filename: .+?\|\s*(.+?)\|$mode\s*$};
-	}
- 	if ( $filename && $opt_cmdline->{encodinglocalefs} !~ /UTF-?8/i ) {
-	 	$filename = encode($opt_cmdline->{encodinglocalefs}, $filename, sub { '' });
+	$filename = $1 if $match =~ m{^filename: .+?\|\s*(.+?)\|$mode\s*$};
+	if ( $filename && $opt_cmdline->{encodinglocalefs} !~ /UTF-?8/i ) {
+		$filename = encode($opt_cmdline->{encodinglocalefs}, $filename, sub { '' });
 	}
 	return search_absolute_path( $filename );
 }
@@ -2399,9 +1862,9 @@ sub search_absolute_path {
 	} else {
 		$abs_path = $filename;
 	}
-	
+
 	#print $se "  ->  ABSPATH='$abs_path'\n";
-	
+
 	return $abs_path;
 }
 
@@ -2421,7 +1884,7 @@ sub pvr_queue {
 	my $out;
 
 	# If a URL was specified by the User (assume auto mode list is OK):
-	if ( $opt->{URL}->{current} =~ m{^http://} ) {
+	if ( $opt->{URL}->{current} =~ m{^https?://} ) {
 		push @record, "$opt->{PROGTYPES}->{current}|$opt->{URL}->{current}|$opt->{URL}->{current}|-";
 	}
 
@@ -2455,7 +1918,7 @@ sub pvr_queue {
 				"pid=$pid",
 				"comment=$comment (queued: ".localtime().')',
 				"type=$type",
-				build_cmd_options( grep !/^(HISTORY|SINCE|BEFORE|HIDEDELETED|FUTURE|SEARCH|SEARCHFIELDS|VERSIONLIST|PROGTYPES|EXCLUDEC.+)$/, @params )
+				build_cmd_options( grep !/^(HISTORY|SINCE|BEFORE|HIDEDELETED|FUTURE|SEARCH|SEARCHFIELDS|PROGTYPES|EXCLUDEC.+)$/, @params )
 			),
 		);
 		print $fh p("Command: ".( join ' ', @cmd ) ) if $opt_cmdline->{debug};
@@ -2542,7 +2005,7 @@ sub recordings_delete {
 				}
 			}
 			if ( ! $deleted ) {
-				print $fh p("No files deleted: $type: '$name - $episode', MODE: $mode, PID: $pid");				
+				print $fh p("No files deleted: $type: '$name - $episode', MODE: $mode, PID: $pid");
 			}
 			closedir(DIR);
 		} else {
@@ -2602,7 +2065,7 @@ sub pvr_add {
 
 	# Only allow alphanumerics,_,-,. here for security reasons
 	my $searchname = "$opt->{SEARCH}->{current}_$opt->{SEARCHFIELDS}->{current}_$opt->{PROGTYPES}->{current}";
-	$searchname =~ s/[^\w\-\. \+\(\)]/_/g;
+	$searchname =~ s/[^\w]+/_/g;
 
 	# Remove a few options from leaking into a PVR search
 	my @cmd = (
@@ -2706,7 +2169,7 @@ sub pvr_save {
 # Build templated HTML for an option specified by passed hashref
 sub build_option_html {
 	my $arg = shift;
-	
+
 	my $title = $arg->{title};
 	my $tooltip = $arg->{tooltip};
 	my $webvar = $arg->{webvar};
@@ -2751,9 +2214,10 @@ sub build_option_html {
 			radio_group(
 				-class		=> 'options',
 				-name		=> $webvar,
-				-values		=> { 0=>'Off' , 1=>'On' },
+				-values => [ 0 , 1 ],
+				-labels		=> { 0=>'Off' , 1=>'On' },
 				-default	=> $current,
-				-override	=> 1,				
+				-override	=> 1,
 			)
 		);
 
@@ -2780,7 +2244,7 @@ sub build_option_html {
 							-override	=> 1,
 							"aria-labelledby"		=> "label_option_${webvar}_$val",
 						),
-						span({ -id=> "label_option_${webvar}_$val" }, $label->{$val})
+						label( { -for => "option_${webvar}_$val"}, span({ -id=> "label_option_${webvar}_$val" }, $label->{$val} ) )
 					] ) ) )
 				);
 			# Spread over more rows if there are many elements
@@ -2792,13 +2256,13 @@ sub build_option_html {
 		my $inner_table = table ( { -class => 'options_embedded' }, Tr( { -class => 'options_embedded' },
 			$element
 		) );
-			
+
 		push @html, th( { -class => 'options', -title => $tooltip }, $title ).td( { -class => 'options' }, $inner_table );
 	# Popup type
 	} elsif ( $type eq 'popup' ) {
 		my @value = $arg->{value};
 		push @html, th( { -class => 'options', -title => $tooltip, -id => "label_option_$webvar" }, $title ).
-		td( { -class => 'options', -title => $tooltip }, 
+		td( { -class => 'options', -title => $tooltip },
 			popup_menu(
 				-class		=> 'options',
 				-name		=> $webvar,
@@ -2836,14 +2300,19 @@ sub refresh {
 	my $typelist = join(",", $cgi->param( 'PROGTYPES' )) || 'tv';
 	my $refreshfuture = $cgi->param( 'REFRESHFUTURE' ) || 0;
 	print $fh "<strong><p>The cache will auto-refresh every $opt->{AUTOWEBREFRESH}->{current} hour(s) if you leave this page open</p></strong>" if $opt->{AUTOWEBREFRESH}->{current};
+	if ( IS_WIN32 ) {
+		print $fh "<strong><p>Windows users: You may encounter errors if you perform other tasks in the Web PVR Manager while this page is reloading</p></strong>" if $opt->{AUTOWEBREFRESH}->{current};
+		print $fh "<strong><p>Windows users: The Web PVR Manager may crash if you leave this window open for a long period of time</p></strong>" if $opt->{AUTOWEBREFRESH}->{current};
+	}
 	print $se "INFO: Refreshing\n";
 	my @cmd = (
 		$opt_cmdline->{getiplayer},
 		'--encoding-locale=UTF-8',
 		'--encoding-console-out=UTF-8',
 		'--nocopyright',
+		'--refresh',
 		'--webrequest',
-		get_iplayer_webrequest_args( 'expiry=30', 'nopurge=1', "type=$typelist", "refreshfuture=$refreshfuture", "search=no search just refresh" ),
+		get_iplayer_webrequest_args( 'nopurge=1', "type=$typelist", "refreshfuture=$refreshfuture" ),
 	);
 	print $fh '<pre>';
 	run_cmd_autorefresh( $fh, $se, 1, @cmd );
@@ -2909,7 +2378,7 @@ sub search_progs {
 
 	#for my $key (sort keys %ENV) {
 	#	print $fh $key, " = ", $ENV{$key}, "\n<br>";
-	#}    
+	#}
 
 	# Get prog data
 	my @params = get_search_params();
@@ -2918,13 +2387,13 @@ sub search_progs {
 		print $fh p("ERROR: get_iplayer returned non-zero:").br().p( join '<br>', $response );
 		return 1;
 	}
-
+	$matchcount ||= 0;
 	my ($first, $last, @pagetrail) = pagetrail( $opt->{PAGENO}->{current}, $opt->{PAGESIZE}->{current}, $matchcount, 7 );
 
 	# Default displaycols
 	my @html;
 	push @html, "<tr>";
-	push @html, th( { -class => 'search' }, checkbox( -class=>'search', -title=>'Select/Unselect All Programmes', -onClick=>"check_toggle(document.form, 'PROGSELECT')", -name=>'SELECTOR', -value=>'1', -label=>'' ) );
+	push @html, th( { -class => 'search' }, checkbox( -class=>'search', -title=>'Select/Unselect All Programmes', -onClick=>"check_toggle(document.form1, 'PROGSELECT')", -name=>'SELECTOR', -value=>'1', -label=>'' ) );
 
 	# Pad empty column for R/S
 	push @html, th( { -class => 'search' }, 'Actions' );
@@ -2936,16 +2405,16 @@ sub search_progs {
 		my ($title, $class, $onclick);
 
 		if ( $opt->{SORT}->{current} eq $heading && not $opt->{REVERSE}->{current} ) {
-			($title, $class, $onclick) = ("Sort by Reverse $heading", 'sorted pointer', "form.NEXTPAGE.value='search_progs'; form.SORT.value='$heading'; form.REVERSE[0].checked=true; form.submit();");
+			($title, $class, $onclick) = ("Sort by Reverse $heading", 'sorted pointer', "form1.NEXTPAGE.value='search_progs'; form1.SORT.value='$heading'; form1.REVERSE[1].checked=true; form1.submit();");
 		} else {
-			($title, $class, $onclick) = ("Sort by $heading", 'unsorted pointer', "form.NEXTPAGE.value='search_progs'; form.SORT.value='$heading'; form.REVERSE[1].checked=true; form.submit();");
+			($title, $class, $onclick) = ("Sort by $heading", 'unsorted pointer', "form1.NEXTPAGE.value='search_progs'; form1.SORT.value='$heading'; form1.REVERSE[0].checked=true; form1.submit();");
 		}
 		$class = 'sorted_reverse pointer' if $opt->{SORT}->{current} eq $heading && $opt->{REVERSE}->{current};
 
-		push @html, 
+		push @html,
 			th( { -class => 'search' },
 				table( { -class => 'searchhead', -role=>'presentation' },
-					Tr( { -class => 'search' }, [ 
+					Tr( { -class => 'search' }, [
 						th( { -class => 'search' },
 							label( {
 								-title		=> $title,
@@ -2969,7 +2438,7 @@ sub search_progs {
 	my $time = time();
 	for ( my $i = 0; $i <= $#pids; $i++ ) {
 		my $search_class = 'search';
-		my $pid = $pids[$i]; 
+		my $pid = $pids[$i];
 		my @row;
 
 		# Grey-out history lines which files have been deleted or where the history doesn't have a filename mentioned
@@ -2983,65 +2452,49 @@ sub search_progs {
 		}
 
 		# Format of PROGSELECT: TYPE|PID|NAME|EPISODE|MODE|CHANNEL
-		push @row, td( {-class=>$search_class},
-			checkbox(
-				-class		=> $search_class,
-				-name		=> 'PROGSELECT',
-				-label		=> '',
-				-value 		=> "$prog{$pid}->{type}|$pid|$prog{$pid}->{name}|$prog{$pid}->{episode}|$prog{$pid}->{mode}|$prog{$pid}->{channel}",
-				-checked	=> 0,
-				-override	=> 1,
-			)
-		);
-		# Record and stream links
-		# Fix output type and mode per prog type
-		my %streamopts = (
-			radio		=> '&MODES=iphone&OUTTYPE=mp3',
-			tv		=> '&MODES=iphone&OUTTYPE=mov',
-			livetv		=> '&MODES=flash&OUTTYPE=flv',
-			liveradio	=> '&MODES=flash&BITRATE=320&OUTTYPE=mp3',
-			itv		=> '&OUTTYPE=asf',
-			localfiles	=> '&OUTTYPE=mp3',
-		);
+		if ( $opt->{HISTORY}->{current} && ! -f $prog{$pid}->{filename} ) {
+			push @row, td( {-class=>$search_class} );
+		} else {
+			push @row, td( {-class=>$search_class},
+					checkbox(
+						-class		=> $search_class,
+						-name		=> 'PROGSELECT',
+						-label		=> '',
+						-value 		=> "$prog{$pid}->{type}|$pid|$prog{$pid}->{name}|$prog{$pid}->{episode}|$prog{$pid}->{mode}|$prog{$pid}->{channel}",
+						-checked	=> 0,
+						-override	=> 1,
+					)
+			);
+		}
+		# Record links
 
 		my $links;
-		# 'Play'
-		# Search mode with filename as pid
-		if ( $pid =~ m{^/} ) {
-			if ( -f $pid ) {
-				# Play
-				$links .= a( { -class=>$search_class, -title=>"Play from file on web server", -href=>build_url_playlist( '', 'playlist', 'pid', $pid, $opt->{MODES}->{current} || $default_modes, $prog{$pid}->{type}, basename( $pid ) , $opt->{STREAMTYPE}->{current}, $opt->{BITRATE}->{current}, $opt->{VSIZE}->{current}, $opt->{VFR}->{current} ) }, 'Play' ).'<br />';
-				# PlayFile
-				$links .= a( { -id=>'nowrap', -class=>$search_class, -title=>"Play from local file", -href=>build_url_playlist( '', 'playlistfiles', 'pid', $pid, $prog{$pid}->{mode}, $prog{$pid}->{type}, undef, undef ) }, 'PlayFile' ).'<br />';
-				# PlayDirect
-				$links .= a( { -id=>'nowrap', -class=>$search_class, -title=>"Stream file into browser", -href=>build_url_direct( '', $prog{$pid}->{type}, $pid, $prog{$pid}->{mode}, $opt->{STREAMTYPE}->{current}, $opt->{STREAMTYPE}->{current}, $opt->{HISTORY}->{current}, $opt->{BITRATE}->{current}, $opt->{VSIZE}->{current}, $opt->{VFR}->{current} ) }, 'PlayDirect' ).'<br />';
-			}
 		# History mode
-		} elsif ( $opt->{HISTORY}->{current} ) {
-			if ( $opt->{HIDEDELETED}->{current} || -f $prog{$pid}->{filename} ) {
+		if ( $opt->{HISTORY}->{current} ) {
+			if ( -f $prog{$pid}->{filename} ) {
 				# Play (Play Remote)
-				$links .= a( { -id=>'nowrap', -class=>$search_class, -title=>"Play from file on web server", -href=>build_url_playlist( '', 'playlistdirect', 'pid', $pid, $prog{$pid}->{mode}, $prog{$pid}->{type}, 'flv', 'flv', $opt->{BITRATE}->{current}, $opt->{VSIZE}->{current}, $opt->{VFR}->{current} ) }, 'Play' ).'<br />';
+				$links .= a( { -id=>'nowrap', -target=>'_blank', -class=>$search_class, -title=>"Stream from file on web server", -href=>build_url_playlist( '', 'playlistdirect', 'pid', $pid, $prog{$pid}->{mode}, $prog{$pid}->{type}, $opt->{STREAMTYPE}->{current}, $opt->{STREAMTYPE}->{current}, $opt->{BITRATE}->{current}, $opt->{VSIZE}->{current}, $opt->{VFR}->{current}, $opt->{VERSIONLIST}->{current} ) }, 'Play' ).'<br />';
 				# PlayFile
-				$links .= a( { -id=>'nowrap', -class=>$search_class, -title=>"Play from local file", -href=>build_url_playlist( '', 'playlistfiles', 'pid', $pid, $prog{$pid}->{mode}, $prog{$pid}->{type}, undef ) }, 'PlayFile' ).'<br />';
+				$links .= a( { -id=>'nowrap', -target=>'_blank', -class=>$search_class, -title=>"Play from local file", -href=>build_url_playlist( '', 'playlistfiles', 'pid', $pid, $prog{$pid}->{mode}, $prog{$pid}->{type}, undef ) }, 'Play File' ).'<br />';
 				# PlayDirect - depends on browser support
-				$links .= a( { -id=>'nowrap', -class=>$search_class, -title=>"Stream file into browser", -href=>build_url_direct( '', $prog{$pid}->{type}, $pid, $prog{$pid}->{mode}, $opt->{STREAMTYPE}->{current}, $opt->{STREAMTYPE}->{current}, $opt->{HISTORY}->{current}, $opt->{BITRATE}->{current}, $opt->{VSIZE}->{current}, $opt->{VFR}->{current} ) }, 'PlayDirect' ).'<br />';
+				if ( $prog{$pid}->{filename} =~ m{\.(m4a|mp4|mp3)$} ) {
+					$links .= a( { -id=>'nowrap', -target=>'_blank', -class=>$search_class, -title=>"Stream file into browser", -href=>build_url_direct( '', $prog{$pid}->{type}, $pid, $prog{$pid}->{mode}, $opt->{STREAMTYPE}->{current}, $opt->{STREAMTYPE}->{current}, $opt->{HISTORY}->{current}, $opt->{BITRATE}->{current}, $opt->{VSIZE}->{current}, $opt->{VFR}->{current}, $opt->{VERSIONLIST}->{current}, 'playdirect' ) }, 'Play Direct' ).'<br />';
+				}
 			}
 		# Search mode
 		} else {
-			# Play
-			$links .= a( { -class=>$search_class, -title=>"Play from Internet", -target=>'_newtab_play_$pid', -href=>build_url_playlist( '', 'playlist', 'pid', $pid, $opt->{MODES}->{current} || $default_modes, $prog{$pid}->{type}, 'out.flv', $opt->{STREAMTYPE}->{current}, $opt->{BITRATE}->{current}, $opt->{VSIZE}->{current}, $opt->{VFR}->{current} ) }, 'Play' ).'<br />';
 			# Record
-			$links .= label( { -id=>'nowrap', -class=>$search_class, -title=>"Record '$prog{$pid}->{name} - $prog{$pid}->{episode}' Now", -onClick => "BackupFormVars(form); form.NEXTPAGE.value='record_now'; form.SEARCH.value='".encode_entities("$prog{$pid}->{type}|$pid|$prog{$pid}->{name}|$prog{$pid}->{episode}|$prog{$pid}->{mode}")."'; form.target='_newtab_$pid'; form.submit(); RestoreFormVars(form); form.target='';" }, 'Record' ).'<br />';
+			$links .= label( { -id=>'nowrap', -class=>$search_class, -title=>"Record '$prog{$pid}->{name} - $prog{$pid}->{episode}' Now", -onClick => "BackupFormVars(form1); form1.NEXTPAGE.value='record_now'; form1.SEARCH.value='".encode_entities("$prog{$pid}->{type}|$pid|$prog{$pid}->{name}|$prog{$pid}->{episode}|$prog{$pid}->{mode}")."'; form1.target='_newtab_$pid'; form1.submit(); RestoreFormVars(form1); form1.target='';" }, 'Record' ).'<br />';
 			# Queue
-			$links .= label( { -id=>'nowrap', -class=>$search_class, -title=>"Queue '$prog{$pid}->{name} - $prog{$pid}->{episode}' for PVR Recording", -onClick => "BackupFormVars(form); form.NEXTPAGE.value='pvr_queue'; form.SEARCH.value='".encode_entities("$prog{$pid}->{type}|$pid|$prog{$pid}->{name}|$prog{$pid}->{episode}|$prog{$pid}->{mode}")."'; form.submit(); RestoreFormVars(form);" }, 'Queue' ).'<br />';
+			$links .= label( { -id=>'nowrap', -class=>$search_class, -title=>"Queue '$prog{$pid}->{name} - $prog{$pid}->{episode}' for PVR Recording", -onClick => "BackupFormVars(form1); form1.NEXTPAGE.value='pvr_queue'; form1.SEARCH.value='".encode_entities("$prog{$pid}->{type}|$pid|$prog{$pid}->{name}|$prog{$pid}->{episode}|$prog{$pid}->{mode}")."'; form1.submit(); RestoreFormVars(form1);" }, 'Queue' ).'<br />';
 			# Add Series
 			# escape regex metacharacters in programme name
 			(my $escaped_name = $prog{$pid}->{name}) =~ s/([\\\^\$\.\|\?\*\+\(\)\[\]])/\\\\$1/g;
 			$links .= label( {
-				-id=>'nowrap', 
+				-id=>'nowrap',
 				-class=>'search pointer_noul',
-				-title=>"Add Series '$prog{$pid}->{name}' to PVR", 
-				-onClick=>"BackupFormVars(form); form.NEXTPAGE.value='pvr_add'; form.SEARCH.value='".encode_entities("^$escaped_name\$")."'; form.SEARCHFIELDS.value='name'; form.PROGTYPES.value='$prog{$pid}->{type}'; form.HISTORY.value='0'; form.SINCE.value=''; form.BEFORE.value=''; form.submit(); RestoreFormVars(form);" }, 'Add Series' );
+				-title=>"Add Series '$prog{$pid}->{name}' to PVR",
+				-onClick=>"BackupFormVars(form1); form1.NEXTPAGE.value='pvr_add'; form1.SEARCH.value='".encode_entities("^$escaped_name\$")."'; form1.SEARCHFIELDS.value='name'; form1.PROGTYPES.value='$prog{$pid}->{type}'; form1.HISTORY.value='0'; form1.SINCE.value=''; form1.BEFORE.value=''; form1.submit(); RestoreFormVars(form1);" }, 'Add Series' );
 		}
 
 		# Add links to row
@@ -3051,50 +2504,55 @@ sub search_progs {
 		for ( @displaycols ) {
 			# display thumb if defined (will have to use proxy to get file:// thumbs)
 			if ( /^thumbnail$/ ) {
-				# Assume a thumbnail prefix if one is missing for BBC iPlayer
-				if ( ! $prog{$pid}->{$_} && $pid =~ m{^[wpb]0[a-z0-9]{6}$} && $prog{$pid}->{type} =~ /^(tv|radio)$/ ) {
-					$prog{$pid}->{$_} = "http://www.bbc.co.uk/iplayer/images/episode/${pid}_150_84.jpg";
+				if ( $prog{$pid}->{$_} !~ m{^https?://} ) {
+					$prog{$pid}->{$_} = DEFAULT_THUMBNAIL;
 				}
-				if ( $prog{$pid}->{$_} =~ m{^http://} ) {
-					push @row, td( {-class=>$search_class}, a( { -title=>"Open original web URL", -class=>$search_class, -href=>$prog{$pid}->{web} }, img( { -class=>$search_class, -height=>40, -src=>$prog{$pid}->{$_} } ) ) );
-				} else {
-					push @row, td( {-class=>$search_class}, a( { -title=>"Open original web URL", -class=>$search_class, -href=>$prog{$pid}->{web} }, 'Open URL' ) );
-				}
+				push @row, td( {-class=>$search_class}, a( { -title=>"Open original web URL", -class=>$search_class, -href=>$prog{$pid}->{web}, -target => "_blank" }, img( { -class=>$search_class, -height=>40, -src=>$prog{$pid}->{$_} } ) ) );
+			} elsif ( /^web$/ ) {
+					push @row, td( {-class=>$search_class}, a( { -title=>"Open original web URL", -class=>$search_class, -href=>$prog{$pid}->{$_}, -target => "_blank" }, 'Open URL' ) );
 			# Calculate the seconds difference between epoch_now and epoch_datestring and convert back into array_time
 			} elsif ( /^timeadded$/ ) {
 				my @t = gmtime( $time - $prog{$pid}->{$_} );
 				my $years = ($t[5]-70)."y " if ($t[5]-70) > 0;
-				push @row, td( {-class=>$search_class}, label( { -class=>$search_class, -title=>"Click for full info", -onClick=>"BackupFormVars(form); form.NEXTPAGE.value='show_info'; form.INFO.value='".encode_entities("$prog{$pid}->{type}|$pid")."'; form.target='_blank'; form.submit(); RestoreFormVars(form); form.target='';" }, "${years}$t[7]d $t[2]h ago" ) );
+				push @row, td( {-class=>$search_class}, label( { -class=>$search_class, -title=>"Click for full info", -onClick=>"BackupFormVars(form1); form1.NEXTPAGE.value='show_info'; form1.INFO.value='".encode_entities("$prog{$pid}->{type}|$pid")."'; form1.target='_blank'; form1.submit(); RestoreFormVars(form1); form1.target='';" }, "${years}$t[7]d $t[2]h ago" ) );
+			} elsif ( /^expires$/ ) {
+				my $expires;
+				if ( $prog{$pid}->{$_} && $prog{$pid}->{$_} > $time ) {
+					my @t = gmtime( $prog{$pid}->{$_} - $time );
+					my $years = ($t[5]-70)."y " if ($t[5]-70) > 0;
+					$expires = "in ${years}$t[7]d $t[2]h";
+				}
+				push @row, td( {-class=>$search_class}, label( { -class=>$search_class, -title=>"Click for full info", -onClick=>"BackupFormVars(form1); form1.NEXTPAGE.value='show_info'; form1.INFO.value='".encode_entities("$prog{$pid}->{type}|$pid")."'; form1.target='_blank'; form1.submit(); RestoreFormVars(form1); form1.target='';" }, $expires ) );
 			# truncate the description if it is too long
 			} elsif ( /^desc$/ ) {
 				my $text = $prog{$pid}->{$_};
 				$text = substr($text, 0, 256).'...[more]' if length( $text ) > 256;
-				push @row, td( {-class=>$search_class}, label( { -class=>$search_class, -title=>"Click for full info", -onClick=>"BackupFormVars(form); form.NEXTPAGE.value='show_info'; form.INFO.value='".encode_entities("$prog{$pid}->{type}|$pid")."'; form.target='_blank'; form.submit(); RestoreFormVars(form); form.target='';" }, $text ) );
+				push @row, td( {-class=>$search_class}, label( { -class=>$search_class, -title=>"Click for full info", -onClick=>"BackupFormVars(form1); form1.NEXTPAGE.value='show_info'; form1.INFO.value='".encode_entities("$prog{$pid}->{type}|$pid")."'; form1.target='_blank'; form1.submit(); RestoreFormVars(form1); form1.target='';" }, $text ) );
 			# Name / Series link
 			} elsif ( /^name$/ ) {
 				push @row, td( {-class=>$search_class}, label( { -class=>$search_class, -id=>'underline', -title=>"Click to list '$prog{$pid}->{$_}'",
 					-onClick=>"
-						BackupFormVars(form);
-						form.NEXTPAGE.value='search_progs';
-						form.SEARCHFIELDS.value='name';
-						form.SEARCH.value='".encode_entities('^'.$prog{$pid}->{$_}.'$')."';
-						form.PAGENO.value=1;
-						form.submit();
-						RestoreFormVars(form);
+						BackupFormVars(form1);
+						form1.NEXTPAGE.value='search_progs';
+						form1.SEARCHFIELDS.value='name';
+						form1.SEARCH.value='".encode_entities('^'.$prog{$pid}->{$_}.'$')."';
+						form1.PAGENO.value=1;
+						form1.submit();
+						RestoreFormVars(form1);
 					"}, $prog{$pid}->{$_} )
 				);
 			# Channel link
 			} elsif ( /^channel$/ ) {
 				push @row, td( {-class=>$search_class}, label( { -class=>$search_class, -id=>'underline', -title=>"Click to list '$prog{$pid}->{$_}'",
 					-onClick=>"
-						BackupFormVars(form);
-						form.NEXTPAGE.value='search_progs';
-						form.CHANNEL.value='".encode_entities('^'.$prog{$pid}->{$_}.'$')."';
-						form.EXCLUDECHANNEL.value='';
-						form.SEARCH.value='.*';
-						form.PAGENO.value=1;
-						form.submit();
-						RestoreFormVars(form);
+						BackupFormVars(form1);
+						form1.NEXTPAGE.value='search_progs';
+						form1.CHANNEL.value='".encode_entities('^'.$prog{$pid}->{$_}.'$')."';
+						form1.EXCLUDECHANNEL.value='';
+						form1.SEARCH.value='.*';
+						form1.PAGENO.value=1;
+						form1.submit();
+						RestoreFormVars(form1);
 					"}, $prog{$pid}->{$_} )
 				);
 			# Category links
@@ -3102,24 +2560,24 @@ sub search_progs {
 				my @cats = split /,/, $prog{$pid}->{$_};
 				for ( @cats ) {
 					my $category = $_;
-					$_ = label( { -class=>$search_class, -id=>'underline', -title=>"Click to list '$category'", 
+					$_ = label( { -class=>$search_class, -id=>'underline', -title=>"Click to list '$category'",
 						-onClick=>"
-							BackupFormVars(form);
-							form.NEXTPAGE.value='search_progs';
-							form.EXCLUDE.value='';
-							form.CATEGORY.value='".encode_entities($category)."';
-							form.EXCLUDECATEGORY.value='';
-							form.SEARCH.value='.*';
-							form.PAGENO.value=1;
-							form.submit();
-							RestoreFormVars(form);
+							BackupFormVars(form1);
+							form1.NEXTPAGE.value='search_progs';
+							form1.EXCLUDE.value='';
+							form1.CATEGORY.value='".encode_entities($category)."';
+							form1.EXCLUDECATEGORY.value='';
+							form1.SEARCH.value='.*';
+							form1.PAGENO.value=1;
+							form1.submit();
+							RestoreFormVars(form1);
 						"},
 					$category );
 				}
 				push @row, td( {-class=>$search_class}, @cats );
 			# Every other column type
 			} else {
-				push @row, td( {-class=>$search_class}, label( { -class=>$search_class, -title=>"Click for full info", -onClick=>"BackupFormVars(form); form.NEXTPAGE.value='show_info'; form.INFO.value='".encode_entities("$prog{$pid}->{type}|$pid")."'; form.target='_blank'; form.submit(); RestoreFormVars(form); form.target='';" }, $prog{$pid}->{$_} ) );
+				push @row, td( {-class=>$search_class}, label( { -class=>$search_class, -title=>"Click for full info", -onClick=>"BackupFormVars(form1); form1.NEXTPAGE.value='show_info'; form1.INFO.value='".encode_entities("$prog{$pid}->{type}|$pid")."'; form1.target='_blank'; form1.submit(); RestoreFormVars(form1); form1.target='';" }, $prog{$pid}->{$_} ) );
 			}
 		}
 		push @html, Tr( {-class=>$search_class}, @row );
@@ -3127,7 +2585,7 @@ sub search_progs {
 
 	# Search form
 	print $fh start_form(
-		-name   => "form",
+		-name   => "form1",
 		-method => "POST",
 	);
 
@@ -3142,10 +2600,8 @@ sub search_progs {
 		my $label = $layout->{$tabname}->{title};
 
 		# Set the colour to grey and change tab appearance if it is selected
-		my $style = 'color: #ADADAD;';
 		my $class = 'options_tab';
 		if ( defined $opt->{$tabname}->{current} && $opt->{$tabname}->{current} eq 'yes' ) {
-			$style = 'color: #F54997;';
 			$class = 'options_tab_sel';
 		}
 		push @optrows_nav, li( { -class=>$class, -id=>"li_${tabname}" },
@@ -3153,7 +2609,6 @@ sub search_progs {
 				-class		=> 'options_outer pointer_noul',
 				-id		=> 'button_'.$tabname,
 				-title		=> "Show $label tab",
-				-style		=> $style,
 				-onClick	=> "show_options_tab( '$tabname', [ '".(join "', '", @tablist )."' ] );",
 			},
 			$label ),
@@ -3167,7 +2622,7 @@ sub search_progs {
 			label( {
 				-class		=> 'options_outer pointer_noul',
 				-title		=> 'Apply Current Options',
-				-onClick	=> "BackupFormVars(form); form.NEXTPAGE.value='search_progs'; form.PAGENO.value=1; form.submit(); RestoreFormVars(form);",
+				-onClick	=> "BackupFormVars(form1); form1.NEXTPAGE.value='search_progs'; form1.PAGENO.value=1; form1.submit(); RestoreFormVars(form1);",
 				-role	=> "button",
 				},
 				'Apply Settings',
@@ -3176,7 +2631,7 @@ sub search_progs {
 			label( {
 				-class		=> 'options_outer pointer_noul',
 				-title		=> 'Remember Current Options as Default',
-				-onClick	=> "BackupFormVars(form); form.SAVE.value=1; form.submit(); RestoreFormVars(form);",
+				-onClick	=> "BackupFormVars(form1); form1.SAVE.value=1; form1.submit(); RestoreFormVars(form1);",
 				-role	=> "button",
 				},
 				'Save As Default',
@@ -3209,7 +2664,7 @@ sub search_progs {
 		} else {
 			push @opt_td, td( { -class=>'options_outer', -id=>"tab_${tabname}", -style=>"$tab->{style}" },
 				table( { -class=>'options' }, Tr( { -class=>'options' }, [ @optrows ] ) )
-			);		
+			);
 		}
 	}
 
@@ -3219,7 +2674,7 @@ sub search_progs {
 		Tr( { -class=>'options_outer' }, (join '', @opt_td) ).
 		Tr( { -class=>'options_outer' }, td( { -class=>'options_outer' }, $options_buttons ) )
 	);
-	
+
 	# Grey-out 'Add Current Search to PVR' button if too many programme matches
 	my $add_search_class_suffix;
 	$add_search_class_suffix = ' darker' if $matchcount > 30;
@@ -3228,7 +2683,7 @@ sub search_progs {
 		{
 			-class => 'action',
 			-title => 'Perform search based on search options',
-			-onClick => "BackupFormVars(form); form.NEXTPAGE.value='search_progs'; form.PAGENO.value=1; form.submit(); RestoreFormVars(form);",
+			-onClick => "BackupFormVars(form1); form1.NEXTPAGE.value='search_progs'; form1.PAGENO.value=1; form1.submit(); RestoreFormVars(form1);",
 		},
 		'Search'
 	);
@@ -3236,7 +2691,7 @@ sub search_progs {
 		{
 			-class => 'action',
 			-title => 'Queue selected programmes (or Quick URL) for one-off recording',
-			-onClick => "if(! ( check_if_selected(document.form, 'PROGSELECT') ||  form.URL.value ) ) { alert('No Quick URL or programmes were selected'); return false; } BackupFormVars(form); form.SEARCH.value=''; form.NEXTPAGE.value='pvr_queue'; form.submit(); RestoreFormVars(form); form.URL.value=''; disable_selected_checkboxes(document.form, 'PROGSELECT');",
+			-onClick => "if(! ( check_if_selected(document.form1, 'PROGSELECT') ||  form1.URL.value ) ) { alert('No Quick URL or programmes were selected'); return false; } BackupFormVars(form1); form1.SEARCH.value=''; form1.NEXTPAGE.value='pvr_queue'; form1.submit(); RestoreFormVars(form1); form1.URL.value=''; disable_selected_checkboxes(document.form1, 'PROGSELECT');",
 		},
 		'Queue'
 	);
@@ -3244,7 +2699,7 @@ sub search_progs {
 		{
 			-class => 'action',
 			-title => 'Immediately Record selected programmes (or Quick URL) in a new tab',
-			-onClick => "if(! ( check_if_selected(document.form, 'PROGSELECT') ||  form.URL.value ) ) { alert('No Quick URL or programmes were selected'); return false; } BackupFormVars(form); form.SEARCH.value=''; form.NEXTPAGE.value='record_now'; var random=Math.floor(Math.random()*99999); form.target='_newtab_'+random; form.submit(); RestoreFormVars(form); form.target=''; form.URL.value=''; disable_selected_checkboxes(document.form, 'PROGSELECT');",
+			-onClick => "if(! ( check_if_selected(document.form1, 'PROGSELECT') ||  form1.URL.value ) ) { alert('No Quick URL or programmes were selected'); return false; } BackupFormVars(form1); form1.SEARCH.value=''; form1.NEXTPAGE.value='record_now'; var random=Math.floor(Math.random()*99999); form1.target='_newtab_'+random; form1.submit(); RestoreFormVars(form1); form1.target=''; form1.URL.value=''; disable_selected_checkboxes(document.form1, 'PROGSELECT');",
 		},
 		'Record'
 	);
@@ -3252,15 +2707,15 @@ sub search_progs {
 		{
 			-class => 'action',
 			-title => 'Permanently delete selected recorded files',
-			-onClick => "if(! check_if_selected(document.form, 'PROGSELECT')) { alert('No programmes were selected'); return false; } BackupFormVars(form); form.SEARCH.value=''; form.NEXTPAGE.value='recordings_delete'; form.submit(); RestoreFormVars(form);",
+			-onClick => "if(! check_if_selected(document.form1, 'PROGSELECT')) { alert('No programmes were selected'); return false; } BackupFormVars(form1); form1.SEARCH.value=''; form1.NEXTPAGE.value='recordings_delete'; form1.submit(); RestoreFormVars(form1);",
 		},
 		'Delete'
 	);
 	$action_button{'Play'} = a(
 		{
 			-class => 'action',
-			-title => 'Get a Playlist based on selected programmes (or Quick URL) to stream in your media player',
-			-onClick => "if(! ( check_if_selected(document.form, 'PROGSELECT') ||  form.URL.value ) ) { alert('No Quick URL or programmes were selected'); return false; } BackupFormVars(form); form.SEARCH.value=''; form.ACTION.value='genplaylist'; form.submit(); form.ACTION.value=''; RestoreFormVars(form); form.URL.value='';",
+			-title => 'Get a Playlist based on selected programmes for remote file streaming in your media player',
+			-onClick => "if(! check_if_selected(document.form1, 'PROGSELECT')) { alert('No programmes were selected'); return false; } BackupFormVars(form1); form1.SEARCH.value=''; form1.ACTION.value='genplaylistdirect'; form1.submit(); RestoreFormVars(form1);",
 		},
 		'Play'
 	);
@@ -3268,17 +2723,9 @@ sub search_progs {
 		{
 			-class => 'action',
 			-title => 'Get a Playlist based on selected programmes for local file streaming in your media player',
-			-onClick => "if(! check_if_selected(document.form, 'PROGSELECT')) { alert('No programmes were selected'); return false; } BackupFormVars(form); form.SEARCH.value=''; form.ACTION.value='genplaylistfile'; form.submit(); RestoreFormVars(form);",
+			-onClick => "if(! check_if_selected(document.form1, 'PROGSELECT')) { alert('No programmes were selected'); return false; } BackupFormVars(form1); form1.SEARCH.value=''; form1.ACTION.value='genplaylistfile'; form1.submit(); RestoreFormVars(form1);",
 		},
 		'Play Files'
-	);
-	$action_button{'Play Remote'} = a(
-		{
-			-class => 'action',
-			-title => 'Get a Playlist based on selected programmes for remote file streaming in your media player',
-			-onClick => "if(! check_if_selected(document.form, 'PROGSELECT')) { alert('No programmes were selected'); return false; } BackupFormVars(form); form.SEARCH.value=''; form.ACTION.value='genplaylistdirect'; form.submit(); RestoreFormVars(form);",
-		},
-		'Play Remote'
 	);
 	# check for an non-whitespace advanced search entries
 	# excluding Programme Version and Search Future Schedule
@@ -3291,11 +2738,12 @@ sub search_progs {
 		$opt->{SINCE}->{current},
 		$opt->{BEFORE}->{current}
 	);
+	(my $escaped_search = $opt->{SEARCH}->{current}) =~ s/'/\\'/g;
 	$action_button{'Add Search to PVR'} = a(
 		{
 			-class => 'action'.$add_search_class_suffix,
 			-title => 'Create a persistent PVR search using the current search terms (i.e. all below programmes)',
-			-onClick => "var version = '$opt->{VERSIONLIST}->{current}'; if ('$opt->{SEARCH}->{current}' == '.*' && $num_adv_srch == 0 && version.toLowerCase().indexOf('default') != -1) { alert('Search = .* will download all available programmes.  Please enter a more specific search term or additional advanced search criteria (excluding $opt->{FUTURE}->{title}).'); return false; } if ('$opt->{SEARCH}->{current}' == '' ) { alert('Please enter a search term. Use Search = .* to record all programmes matching advanced search criteria.'); return false; } if ( $matchcount > 30 ) { alert('Please limit your search to result in no more than 30 current programmes'); return false; }  BackupFormVars(form); form.NEXTPAGE.value='pvr_add'; form.submit(); RestoreFormVars(form);",
+			-onClick => "if ('".$escaped_search."' == '.*' && $num_adv_srch == 0) { alert('Search = .* will download all available programmes.  Please enter a more specific search term or additional advanced search criteria (excluding $opt->{VERSIONLIST}->{title} and $opt->{FUTURE}->{title}).'); return false; } if ('".$escaped_search."' == '' ) { alert('Please enter a search term. Use Search = .* to record all programmes matching advanced search criteria.'); return false; } if ( $matchcount > 30 ) { alert('Please limit your search to result in no more than 30 current programmes'); return false; }  BackupFormVars(form1); form1.NEXTPAGE.value='pvr_add'; form1.submit(); RestoreFormVars(form1);",
 		},
 		'Add Search to PVR'
 	);
@@ -3304,7 +2752,7 @@ sub search_progs {
 		{
 			-class => 'action',
 			-title => 'Refresh the list of programmes - can take a while',
-			-onClick => "BackupFormVars(form); form.target='_newtab_refresh'; form.NEXTPAGE.value='refresh'; form.submit(); RestoreFormVars(form); form.target=''; form.NEXTPAGE.value=''; ",
+			-onClick => "BackupFormVars(form1); form1.target='_newtab_refresh'; form1.NEXTPAGE.value='refresh'; form1.submit(); RestoreFormVars(form1); form1.target=''; form1.NEXTPAGE.value=''; ",
 			#-onClick => "window.frames['dataframe'].window.location.replace('?NEXTPAGE=refresh&AUTOWEBREFRESH=$autorefresh')",
 		},
 		'Refresh Cache'
@@ -3320,8 +2768,6 @@ sub search_progs {
 					$action_button{'Delete'},
 					$action_button{'Play'},
 					$action_button{'Play Files'},
-					$action_button{'Play Remote'},
-					$action_button{'Add Search to PVR'},
 				]),
 			),
 		);
@@ -3331,16 +2777,14 @@ sub search_progs {
 				li( { -class=>'action' }, [
 					$action_button{'Search'},
 					$action_button{'Record'},
-					$action_button{'Play'},
 					$action_button{'Queue'},
-					$action_button{'Play Remote'},
 					$action_button{'Add Search to PVR'},
 					$action_button{'Refresh Cache'},
 				]),
 			),
 		);
 	}
-	
+
 	print $fh @actionbar;
 	print $fh @pagetrail;
 	print $fh table( {-class=>'search', -role=>'main' }, @html );
@@ -3361,7 +2805,8 @@ sub pagetrail {
 	my ( $page, $pagesize, $count, $trailsize ) = ( @_ );
 
 	# How many pages
-	my $pages = int( $count / $pagesize ) + 1;
+	my $pages = int( $count / $pagesize );
+	$pages++ if $count % $pagesize;
 	# If we request a page that is too high
 	$page = $pages if $page > $pages;
 	# Calc first and last programme numbers
@@ -3376,24 +2821,24 @@ sub pagetrail {
 	push @pagetrail, td( { -class=>'pagetrail pointer' }, label( {
 		-title		=> "Previous Page",
 		-class		=> 'pagetrail pointer',
-		-onClick	=> "BackupFormVars(form); form.NEXTPAGE.value='search_progs'; form.PAGENO.value=$page-1; form.submit(); RestoreFormVars(form);",},
+		-onClick	=> "BackupFormVars(form1); form1.NEXTPAGE.value='search_progs'; form1.PAGENO.value=$page-1; form1.submit(); RestoreFormVars(form1);",},
 		"<<",
 	)) if $page > 1;
 
 	push @pagetrail, td( { -class=>'pagetrail pointer' }, label( {
 		-title		=> "Page 1",
 		-class		=> 'pagetrail pointer',
-		-onClick	=> "BackupFormVars(form); form.NEXTPAGE.value='search_progs'; form.PAGENO.value=1; form.submit(); RestoreFormVars(form);",},
+		-onClick	=> "BackupFormVars(form1); form1.NEXTPAGE.value='search_progs'; form1.PAGENO.value=1; form1.submit(); RestoreFormVars(form1);",},
 		"1",
 	)) if $page > 1;
 
 	push @pagetrail, td( { -class=>'pagetrail' }, '...' ) if $page > $trailsize+2;
 
- 	for (my $pn=$page-$trailsize; $pn <= $page+$trailsize; $pn++) {
+	for (my $pn=$page-$trailsize; $pn <= $page+$trailsize; $pn++) {
 		push @pagetrail, td( { -class=>'pagetrail pointer' }, label( {
 			-title		=> "Page $pn",
 			-class		=> 'pagetrail pointer',
-			-onClick	=> "BackupFormVars(form); form.NEXTPAGE.value='search_progs'; form.PAGENO.value='$pn'; form.submit(); RestoreFormVars(form);",},
+			-onClick	=> "BackupFormVars(form1); form1.NEXTPAGE.value='search_progs'; form1.PAGENO.value='$pn'; form1.submit(); RestoreFormVars(form1);",},
 			"$pn",
 		)) if $pn > 1 && $pn != $page && $pn < $pages;
 		push @pagetrail, td( { -class=>'pagetrail' }, label( {
@@ -3407,14 +2852,14 @@ sub pagetrail {
 	push @pagetrail, td( { -class=>'pagetrail pointer' }, label( {
 		-title		=> "Page ".$pages,
 		-class		=> 'pagetrail pointer',
-		-onClick	=> "BackupFormVars(form); form.NEXTPAGE.value='search_progs'; form.PAGENO.value=$pages; form.submit(); RestoreFormVars(form);",},
+		-onClick	=> "BackupFormVars(form1); form1.NEXTPAGE.value='search_progs'; form1.PAGENO.value=$pages; form1.submit(); RestoreFormVars(form1);",},
 		"$pages",
 	)) if $page < $pages;
 
 	push @pagetrail, td( { -class=>'pagetrail pointer' }, label( {
 		-title		=> "Next Page",
 		-class		=> 'pagetrail pointer',
-		-onClick	=> "BackupFormVars(form); form.NEXTPAGE.value='search_progs'; form.PAGENO.value=$page+1; form.submit(); RestoreFormVars(form);",},
+		-onClick	=> "BackupFormVars(form1); form1.NEXTPAGE.value='search_progs'; form1.PAGENO.value=$page+1; form1.submit(); RestoreFormVars(form1);",},
 		">>",
 	)) if $page < $pages;
 
@@ -3539,7 +2984,7 @@ sub get_display_cols {
 
 #############################################
 #
-# Form Header 
+# Form Header
 #
 #############################################
 sub form_header {
@@ -3550,16 +2995,6 @@ sub form_header {
 			-name   => "formheader",
 			-method => "POST",
 	);
-	
-	# Only highlight the 'Update Software' option if the script is writable or is not win32
-	my $update_element = a( { -class=>'nav darker' }, 'Update Software' );
-	$update_element = a(
-		{
-			-class=>'nav',
-			-title=>'Update the Web PVR Manager and get_iplayer software - please restart Web PVR Manager after updating',
-			-onClick => "if (! confirm('Please restart the Web PVR Manager service once the update has completed') ) { return false; } BackupFormVars(formheader); formheader.NEXTPAGE.value='update_script'; formheader.submit(); RestoreFormVars(formheader);",
-		},
-		'Update Software' ) if -w $0 && ! IS_WIN32;
 
 	# set $class for tab selection in nav bar
 	my $class = {};
@@ -3567,12 +3002,10 @@ sub form_header {
 	$class->{recordings}	= 'nav_tab';
 	$class->{pvrlist}	= 'nav_tab';
 	$class->{pvrrun}	= 'nav_tab';
-	$class->{update}	= 'nav_tab';
 	$class->{search}	= 'nav_tab_sel' if ( $nextpage eq 'search_progs' || ! $nextpage ) && ! $opt->{HISTORY}->{current};
 	$class->{recordings}	= 'nav_tab_sel' if $nextpage eq 'search_history' || $opt->{HISTORY}->{current};
 	$class->{pvrrun}	= 'nav_tab_sel' if $nextpage eq 'pvr_run';
 	$class->{pvrlist}	= 'nav_tab_sel' if $nextpage =~ m{^(pvr_list|pvr_queue|pvr_del)$};
-	$class->{update}	= 'nav_tab_sel' if $nextpage eq 'update_script';
 
 	print $fh div( { -class=>'nav', -role=>'navigation' },
 		ul( { -class=>'nav' },
@@ -3583,18 +3016,17 @@ sub form_header {
 			li( { -class=>$class->{recordings} }, a( { -class=>'nav', -title=>'History search page', -onClick => "BackupFormVars(formheader); formheader.NEXTPAGE.value='search_history'; formheader.submit(); RestoreFormVars(formheader);" }, 'Recordings' ) ).
 			li( { -class=>$class->{pvrlist} }, a( { -class=>'nav', -title=>'List all saved PVR searches', -onClick => "BackupFormVars(formheader); formheader.NEXTPAGE.value='pvr_list'; formheader.submit(); RestoreFormVars(formheader);" }, 'PVR List' ) ).
 			li( { -class=>$class->{pvrrun} }, a( { -class=>'nav', -title=>'Run the PVR now - wait for the PVR to complete', -onClick => "BackupFormVars(formheader); formheader.NEXTPAGE.value='pvr_run'; formheader.target='_newtab_pvrrun'; formheader.submit(); RestoreFormVars(formheader); formheader.target='';" }, 'Run PVR' ) ).
-			li( { -class=>$class->{update} }, $update_element ).
-			li( { -class=>'nav_tab' }, a( { -class=>'nav', -title=>'Show help and instructions', -href => "https://github.com/get-iplayer/get_iplayer/wiki/webpvr", -target => "_new" }, 'Help' ) )
+			li( { -class=>'nav_tab' }, a( { -class=>'nav', -title=>'Show help and instructions', -href => "https://github.com/get-iplayer/get_iplayer/wiki/webpvr", -target => "_newtab_help" }, 'Help' ) )
 		),
 	);
 	print $fh hidden( -name => 'AUTOPVRRUN', -value => $opt->{AUTOPVRRUN}->{current}, -override => 1 );
 	print $fh hidden( -name => 'NEXTPAGE', -value => 'search_progs', -override => 1 );
-	print $fh $cgi->end_form();	
+	print $fh $cgi->end_form();
 }
 
 
 
-# Form Footer 
+# Form Footer
 sub form_footer {
 	#print $fh "<iframe src=\"about:blank\" height=\"100\" width=\"95%\" name=\"dataframe\"></iframe>";
 	#print $fh "<iframe src=\"about:blank\" height=\"0\" width=\"0\" name=\"dataframe\"></iframe>";
@@ -3628,7 +3060,7 @@ sub process_params {
 		value	=> 20, # width values
 		save	=> 0,
 	};
-	
+
 	$opt->{URL} = {
 		title	=> 'Quick URL', # Title
 		tooltip	=> "Enter your URL for Recording (then click 'Record' or 'Play')", # Tooltip
@@ -3638,7 +3070,7 @@ sub process_params {
 		value	=> 36, # width values
 		save	=> 0,
 	};
-	
+
 	$opt->{SEARCHFIELDS} = {
 		title	=> 'Search in', # Title
 		tooltip	=> 'Select which column you wish to search', # Tooltip
@@ -3656,9 +3088,9 @@ sub process_params {
 		tooltip	=> 'Select the number of search results displayed on each page', # Tooltip
 		webvar	=> 'PAGESIZE', # webvar
 		type	=> 'popup', # type
-		default	=> 20, # default
+		default	=> 10, # default
 		value	=> ['10','25','50','100','200','400'], # values
-		onChange=> "BackupFormVars(form); form.NEXTPAGE.value='search_progs'; form.PAGENO.value=1; form.submit(); RestoreFormVars(form);",
+		onChange=> "BackupFormVars(form1); form1.NEXTPAGE.value='search_progs'; form1.PAGENO.value=1; form1.submit(); RestoreFormVars(form1);",
 		save	=> 1,
 	};
 
@@ -3670,7 +3102,7 @@ sub process_params {
 		label	=> \%fieldname, # labels
 		default	=> 'index', # default
 		value	=> [@headings], # values
-		onChange=> "BackupFormVars(form); form.NEXTPAGE.value='search_progs'; form.submit(); RestoreFormVars(form);",
+		onChange=> "BackupFormVars(form1); form1.NEXTPAGE.value='search_progs'; form1.submit(); RestoreFormVars(form1);",
 		save	=> 1,
 	};
 
@@ -3679,7 +3111,7 @@ sub process_params {
 		tooltip	=> 'Reverse the sort order', # Tooltip
 		webvar	=> 'REVERSE', # webvar
 		type	=> 'radioboolean', # type
-		#onChange=> "BackupFormVars(form); form.NEXTPAGE.value='search_progs'; form.submit(); RestoreFormVars(form);",
+		#onChange=> "BackupFormVars(form1); form1.NEXTPAGE.value='search_progs'; form1.submit(); RestoreFormVars(form1);",
 		default	=> '0', # value
 		save	=> 1,
 	};
@@ -3698,16 +3130,16 @@ sub process_params {
 	};
 
 	$opt->{MODES} = {
-		title	=> 'Recording Modes<br/>(set to <i>best</i> for HD TV)', # Title
-		tooltip	=> 'Comma separated list of recording modes which should be tried in order. Set to "best" (without quotes) for HD TV (if available, with fallback to SD TV). Set to "default" (without quotes) for best available SD TV.  Set to "good" (without quotes) for lower-quality SD TV.', # Tooltip
+		title	=> 'Recording Modes', # Title
+		tooltip	=> 'Comma separated list of recording modes which should be tried in order. Default is "best" for HD TV (if available, with fallback to SD TV). Set to "better" (without quotes) for best available SD TV.  Set to "good" (without quotes) for lower-quality SD TV.', # Tooltip
 		webvar	=> 'MODES', # webvar
 		optkey	=> 'modes', # option
 		type	=> 'text', # type
-		default	=> 'default', # default
+		default	=> '', # default
 		value	=> 30, # width values
 		save	=> 1,
 	};
-	
+
 	$opt->{OUTPUT} = {
 		title	=> 'Override Recordings Folder', # Title
 		tooltip	=> 'Folder on the server where recordings should be saved', # Tooltip
@@ -3718,7 +3150,7 @@ sub process_params {
 		value	=> 30, # width values
 		save	=> 1,
 	};
-	
+
 	$opt->{PROXY} = {
 		title	=> 'Web Proxy URL', # Title
 		tooltip	=> 'e.g. http://192.168.1.2:8080', # Tooltip
@@ -3729,21 +3161,21 @@ sub process_params {
 		value	=> 30, # width values
 		save	=> 1,
 	};
-	
+
 	$opt->{VERSIONLIST} = {
 		title	=> 'Programme Version', # Title
-		tooltip	=> 'Comma separated list of versions to try to record in order (e.g. default,signed,audiodescribed)', # Tooltip
+		tooltip	=> 'Comma separated list of versions to try to record in order (e.g., "signed,default" or "audiodescribed,default")', # Tooltip
 		webvar	=> 'VERSIONLIST', # webvar
 		optkey	=> 'versionlist', # option
 		type	=> 'text', # type
-		default	=> 'default', # default
+		default	=> '', # default
 		value	=> 30, # width values
 		save	=> 1,
 	};
 
 	$opt->{EXCLUDE} = {
 		title	=> 'Exclude Programmes', # Title
-		tooltip	=> 'Comma separated list of programmes to exclude. Partial word matches are supported', # Tooltip
+		tooltip	=> 'Comma separated list of programmes to exclude. Partial word matches and regular expressions are supported', # Tooltip
 		webvar	=> 'EXCLUDE', # webvar
 		optkey	=> 'exclude', # option
 		type	=> 'text', # type
@@ -3754,7 +3186,7 @@ sub process_params {
 
 	$opt->{CATEGORY} = {
 		title	=> 'Categories Containing', # Title
-		tooltip	=> 'Comma separated list of categories to match. Partial word matches are supported', # Tooltip
+		tooltip	=> 'Comma separated list of categories to match. Partial word matches and regular expressions are supported.  Only works in Recordings tab.', # Tooltip
 		webvar	=> 'CATEGORY', # webvar
 		optkey	=> 'category', # option
 		type	=> 'text', # type
@@ -3765,7 +3197,7 @@ sub process_params {
 
 	$opt->{EXCLUDECATEGORY} = {
 		title	=> 'Exclude Categories Containing', # Title
-		tooltip	=> 'Comma separated list of categories to exclude. Partial word matches are supported', # Tooltip
+		tooltip	=> 'Comma separated list of categories to exclude. Partial word matches and regular expressions are supported. Only works in Recordings tab.', # Tooltip
 		webvar	=> 'EXCLUDECATEGORY', # webvar
 		optkey	=> 'excludecategory', # option
 		type	=> 'text', # type
@@ -3776,7 +3208,7 @@ sub process_params {
 
 	$opt->{CHANNEL} = {
 		title	=> 'Channels Containing', # Title
-		tooltip	=> 'Comma separated list of channels to match. Partial word matches are supported', # Tooltip
+		tooltip	=> 'Comma separated list of channels to match. Partial word matches and regular expressions are supported', # Tooltip
 		webvar	=> 'CHANNEL', # webvar
 		optkey	=> 'channel', # option
 		type	=> 'text', # type
@@ -3787,7 +3219,7 @@ sub process_params {
 
 	$opt->{EXCLUDECHANNEL} = {
 		title	=> 'Exclude Channels Containing', # Title
-		tooltip	=> 'Comma separated list of channels to exclude. Partial word matches are supported', # Tooltip
+		tooltip	=> 'Comma separated list of channels to exclude. Partial word matches and regular expressions are supported', # Tooltip
 		webvar	=> 'EXCLUDECHANNEL', # webvar
 		optkey	=> 'excludechannel', # option
 		type	=> 'text', # type
@@ -3826,9 +3258,19 @@ sub process_params {
 		save	=> 1,
 	};
 
-	my %metadata_labels = ( ''=>'Off', xbmc=>'XBMC Episode nfo format', xbmc_movie=>'XBMC Movie nfo format', generic=>'Generic XML', freevo=>'Freevo FXD' );
+	$opt->{FPS25} = {
+		title	=> 'Use only 25fps streams',
+		tooltip	=> "Use only 25fps media streams. HD video not available.",
+		webvar	=> 'FPS25',
+		optkey	=> 'fps25',
+		type	=> 'radioboolean',
+		default	=> '0',
+		save	=> 1,
+	};
+
+	my %metadata_labels = ( ''=>'Off', generic=>'Generic XML' );
 	$opt->{METADATA} = {
-		title	=> 'Download Meta-data', # Title
+		title	=> 'Download Metadata', # Title
 		tooltip	=> 'Format of metadata file to create when recording', # Tooltip
 		webvar	=> 'METADATA', # webvar
 		optkey	=> 'metadata', # option
@@ -3836,7 +3278,7 @@ sub process_params {
 		#label	=> \%fieldname, # labels
 		label	=> \%metadata_labels, # labels
 		default	=> '', # default
-		value	=> [ ( '', 'xbmc', 'xbmc_movie', 'generic', 'freevo' ) ], # values
+		value	=> [ ( '', 'generic' ) ], # values
 		save	=> 1,
 	};
 
@@ -3865,7 +3307,7 @@ sub process_params {
 		tooltip	=> 'Automatically refresh the default caches in another browser tab (hours)', # Tooltip
 		webvar	=> 'AUTOWEBREFRESH', # webvar
 		type	=> 'text', # type
-		default	=> 1, # default
+		default	=> 4, # default
 		value	=> 3, # width values
 		save	=> 1,
 	};
@@ -3933,10 +3375,10 @@ sub process_params {
 		save	=> 1,
 	};
 
-	my %vsize_labels = ( ''=>'Native', '1280x720'=>'1280x720', '832x468'=>'832x468', '640x360'=>'640x360', '512x288'=>'512x288', '480x272'=>'480x272', '320x176'=>'320x176', '176x96'=>'176x96' );
+	my %vsize_labels = ( ''=>'Native', '1280x720'=>'1280x720', '960x540'=>'960x540', '832x468'=>'832x468', '704x396'=>'704x396', '640x360'=>'640x360', '512x288'=>'512x288', '448x252'=>'448x252', '384x216'=>'384x216', '256x144'=>'256x144', '192x108'=>'192x108' );
 	$opt->{VSIZE} = {
 		title	=> 'Remote Streaming Video Size', # Title
-		tooltip	=> "Video size '<width>x<height>' to transcode remotely played files - leave blank for native size", # Tooltip
+		tooltip	=> "Video size '<width>x<height>' to transcode remotely played files - specify 'Native' for native size", # Tooltip
 		webvar	=> 'VSIZE', # webvar
 		type	=> 'popup', # type
 		label	=> , \%vsize_labels, # labels
@@ -3964,17 +3406,16 @@ sub process_params {
 		default => '',
 		save	=> 1,
 	};
-
-	my %streamtype_labels = ( ''=>'Auto', 'none'=>'Disable Transcoding', 'flv'=>'Flash Video (flv)', 'mov'=>'Quicktime (mov)', 'asf'=>'Advanced Streaming Format (asf)', 'avi'=>'AVI', 'mp3'=>'MP3 (Audio Only)', 'aac'=>'AAC (Audio Only)', 'wav'=>'WAV (Audio Only)', 'flac'=>'FLAC (Audio Only)' );
+	my %streamtype_labels = ( ''=>'Auto', 'none'=>'Disable Transcoding', 'flv'=>'Flash Video (H.264/MP3)', 'mpegts'=>'MPEG Transport Stream (H.264/MP2)', 'matroska'=>'Matroska (H.264/Vorbis)', 'asf'=>'Advanced Systems Format (H.264/WMA)', 'mp3'=>'MP3 (Audio Only)', 'adts'=>'AAC (Audio Only)', 'oga'=>'Vorbis (Audio Only)', 'wav'=>'WAV (Audio Only)', 'flac'=>'FLAC (Audio Only)' );
 	$opt->{STREAMTYPE} = {
 		title	=> "Remote Streaming type", # Title
-		tooltip	=> "Force the output to be this type when using 'Play Remote' for 'PlayDirect' streaming(e.g. flv, mov). Specify 'none' to disable transcoding/remuxing.  Leave blank for auto-detection", # Tooltip
+		tooltip	=> "Force the output to be this type when using 'Play' streaming. Specify 'Native' to disable transcoding/remuxing.", # Tooltip
 		webvar	=> 'STREAMTYPE', # webvar
 		type	=> 'popup', # type
 		label	=> , \%streamtype_labels, # labels
 		default	=> '', # default
-		value	=> [ '', 'none', 'flv', 'mov', 'asf', 'avi', 'mp3', 'aac', 'wav', 'flac' ], # values
-		onChange=> "form.submit();",
+		value	=> [ '', 'none', 'flv', 'mpegts', 'matroska', 'asf', 'mp3', 'adts', 'oga', 'wav', 'flac' ], # values
+		onChange=> "form1.submit();",
 		save	=> 1,
 	};
 
@@ -4026,7 +3467,7 @@ sub process_params {
 		save	=> 0,
 	};
 
-	# Remeber the status of the tab options display
+	# Remember the status of the tab options display
 	for my $tabname ( grep !/BASICTAB/, @{ $layout->{taborder} } ) {
 		my $default = 'no';
 		# By default only show advanced search tab
@@ -4070,7 +3511,7 @@ sub process_params {
 				$opt->{$_}->{current} =  join ",", $opt->{$_}->{default};
 			}
 			print $se "DEBUG: Using $_ = $opt->{$_}->{current}\n--\n" if $opt_cmdline->{debug};
-			
+
 		} else {
 			$opt->{$_}->{current} = join(",", $cgi->param($_) ) || $opt->{$_}->{default} if not defined $opt->{$_}->{current};
 		}
@@ -4082,7 +3523,7 @@ sub process_params {
 ######################################################################
 #
 #   begin_html
-# 
+#
 #   Send HTTP headers to browser
 #   Sets "title", Sends <HTML> and <BODY> flags
 #
@@ -4090,7 +3531,7 @@ sub process_params {
 sub begin_html {
 	my $request_host = shift;
 	my $mimetype = 'text/html';
-	
+
 	# Save settings if selected
 	my @cookies;
 	if ( $cgi->param('SAVE') ) {
@@ -4120,10 +3561,10 @@ sub begin_html {
 	my $title;
 	my $autorefresh = $cgi->cookie( 'AUTOWEBREFRESH' ) || $cgi->param( 'AUTOWEBREFRESH' );
 	my $autopvrrun  = $cgi->cookie( 'AUTOPVRRUN' ) || $cgi->param( 'AUTOPVRRUN' );
-	if ( $autorefresh && $cgi->param( 'NEXTPAGE' ) eq 'refresh' ) {
+	if ( $autorefresh > 0 && $cgi->param( 'NEXTPAGE' ) eq 'refresh' ) {
 		$body_element = "<BODY onLoad=\"javascript:RefreshTab( '${request_host}?NEXTPAGE=refresh&AUTOWEBREFRESH=$autorefresh&PROGTYPES=$opt->{PROGTYPES}->{current}', ".(1000*3600*$autorefresh)." );\">";
 		$title = 'Refreshing Cache: get_iplayer Web PVR Manager';
-	} elsif ( $autopvrrun && $cgi->param( 'NEXTPAGE' ) eq 'pvr_run' ) {
+	} elsif ( $autopvrrun > 0 && $cgi->param( 'NEXTPAGE' ) eq 'pvr_run' ) {
 		$body_element = "<BODY onLoad=\"javascript:RefreshTab( '${request_host}?NEXTPAGE=pvr_run&AUTOPVRRUN=$autopvrrun', ".(1000*3600*$autopvrrun)." );\">";
 		$title = 'Running PVR: get_iplayer Web PVR Manager';
 	} else {
@@ -4136,6 +3577,7 @@ sub begin_html {
 	print $fh '<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">'."\n";
 	print $fh "<html>";
 	print $fh "<HEAD><TITLE>$title</TITLE>\n";
+	print $fh "<base href=\"$opt_cmdline->{baseurl}\">\n" if $opt_cmdline->{baseurl};
 	insert_stylesheet();
 	print $fh "</HEAD>\n";
 	insert_javascript();
@@ -4154,10 +3596,13 @@ sub insert_javascript {
 	print $fh <<EOF;
 
 	<script type="text/javascript">
-	
+
 	function RefreshTab(url, time, force ) {
 		if ( force ) {
 			window.location.href = url;
+		}
+		if ( time <= 0 ) {
+			return;
 		}
 		setTimeout( "RefreshTab('" + url + "'," + time + ", 1 )", time );
 	}
@@ -4165,33 +3610,33 @@ sub insert_javascript {
 
 	// global hash table for saving copy of form
 	var form_backup = {};
-	
+
 	//
 	// Copy all non-grouped form values into a global hash
 	//
-	function BackupFormVars( form ) {
+	function BackupFormVars( f ) {
 		// empty out array
 		for(var key in form_backup) {
 			delete( form_backup[key] );
 		}
 
 		// copy forms elements
-		var elem = form.elements;
+		var elem = f.elements;
 		for(var i = 0; i < elem.length; i++) {
 			// exclude radio and checkbox types - can be duplicate names in groups...
 			if ( elem[i].type != "checkbox" && elem[i].type != "radio" ) {
 				form_backup[ elem[i].name ] = elem[i].value;
 			}
-		} 
+		}
 	}
 
 	//
 	// Copy all form values in the global hash into the specified form
-	//	
-	function RestoreFormVars( form ) {
+	//
+	function RestoreFormVars( f ) {
 		// copy form elements
 		for(var key in form_backup) {
-			form.elements[ key ].value = form_backup[key];
+			f.elements[ key ].value = form_backup[key];
 			// delete element
 			delete( form_backup[key] );
 		}
@@ -4223,7 +3668,7 @@ sub insert_javascript {
 				tab.style.visibility = 'visible';
 				option.value = 'yes';
 				//button.innerHTML = '- ' + button.innerHTML.substring(2);
-				button.style.color = '#F54997';
+				//button.style.color = '#F54997';
 				//li.style.borderBottom = '0px solid #666';
 				li.className = 'options_tab_sel';
 			} else {
@@ -4231,14 +3676,14 @@ sub insert_javascript {
 				tab.style.visibility = 'collapse';
 				option.value = 'no';
 				//button.innerHTML = '+ ' + button.innerHTML.substring(2);
-				button.style.color = '#ADADAD';
+				//button.style.color = '#ADADAD';
 				//li.style.borderBottom = '1px solid #666';
 				li.className = 'options_tab';
 			}
 		}
 		return true;
 	}
-	
+
 	//
 	// Check/Uncheck all checkboxes named <name>
 	//
@@ -4316,9 +3761,9 @@ sub insert_javascript {
 	function submitonEnter(evt){
 		var charCode = (evt.which) ? evt.which : event.keyCode
 		if ( charCode == "13" ) {
-			document.form.NEXTPAGE.value='search_progs';
-			document.form.PAGENO.value=1;
-			document.form.submit();
+			document.form1.NEXTPAGE.value='search_progs';
+			document.form1.PAGENO.value=1;
+			document.form1.submit();
 		}
 	}
 
@@ -4337,121 +3782,185 @@ sub insert_stylesheet {
 	print $fh <<EOF;
 
 	<STYLE type="text/css">
-	
-	.pointer		{ cursor: pointer; cursor: hand; }
-	.pointer:hover		{ text-decoration: underline; }
 
-	.pointer_noul		{ cursor: pointer; cursor: hand; }
+	body {
+		background: #000;
+		color: #fff;
+		font-family: Arial,Helvetica,sans-serif;
+		font-size: 100%;
+	}
 
-	.extra_border		{ border-left: 2px solid #666; }
-	.all_borders		{ border-left: 2px solid #666; border-right: 2px solid #666; border-top: 2px solid #666; border-bottom: 2px solid #666; }
+	img	{
+		border: 0;
+	}
 
-	.darker			{ color: #7D7D7D; }
-	#logo			{ width: 190px; border-width: 0 0 1px 0; }
-	#underline		{ text-decoration: underline; }
-	#nowrap			{ white-space: nowrap; }
-	#smaller80pc		{ font-size: 80%; }
+	input, select {
+		background: #ddd;
+		border: 0;
+	}
 
-	BODY			{ color: #FFF; background: black; font-size: 90%; font-family: verdana, sans-serif; }
-	IMG			{ border: 0; }
-	INPUT			{ border: 0 none; background: #ddd; }
-	A			{ color: #FFF; text-decoration: none; }
-	A:hover			{ text-decoration: none; }
+	input {
+		font-size: 1em;
+	}
 
-	TABLE.title 		{ font-size: 150%; border-spacing: 0px; padding: 0px; }
-	A.title			{ color: #F54997; font-weight: bold; font-family: Arial,Helvetica,sans-serif; }
+	a {
+		color: #fff;
+		text-decoration: none;
+	}
 
-	/* Nav bar */
-	DIV.nav			{ font-family: Arial,Helvetica,sans-serif; background-color: #000; color: #FFF; }
-	UL.nav			{ cursor: pointer; cursor: hand; padding-left: 0px; background-color: #000; font-size: 100%; font-weight: bold; height: 44px; margin: 0; margin-left: 0px; list-style-image: none; overflow: hidden; }
-	LI.nav_tab		{ padding-left: 0px; border-top: 1px solid #444; border-left: 1px solid #444; border-right: 1px solid #444; border-bottom: 1px solid #888; display: inline; float: left; height: 42px; margin: 0; width: 13%; }
-	LI.nav_tab_sel		{ padding-left: 0px; border-top: 1px solid #888; border-left: 1px solid #888; border-right: 1px solid #888; border-bottom: 0px solid #888; display: inline; float: left; height: 42px; margin: 0; width: 13%; }
-	A.nav			{ display: block; height: 42px; line-height: 42px; text-align: center; }
-	IMG.nav			{ padding: 7px; display: block; text-align: center; text-decoration: none; }
-	A.nav:hover		{ color: #ADADAD; }
+	a[href], a[onclick], label[onclick], :link, :visited {
+		cursor: pointer;
+	}
 
-	TABLE.header		{ font-size: 80%; border-spacing: 1px; padding: 0; }
-	INPUT.header		{ font-size: 80%; } 
-	SELECT.header		{ font-size: 80%; } 
+	ul.nav,
+	ul.options_tab,
+	ul.action {
+		list-style: none;
+		margin: 8px 0;
+		padding: 0;
+	}
 
-	TABLE.types		{ font-size: 70%; text-align: left; border-spacing: 0px; padding: 0; }
-	TR.types		{ white-space: nowrap; }
-	TD.types		{ width: 20px }
-	
-	TABLE.options_embedded	{ font-size: 100%; text-align: left; border-spacing: 0px; padding: 0; white-space: nowrap; }
-	TR.options_embedded	{ white-space: nowrap; }
-	TH.options_embedded	{ width: 20px }
-	TD.options_embedded	{ width: 20px }
+	ul.nav, ul.action {
+		font-size: 1em;
+	}
 
-	/*DIV.options		{ padding-top: 10px; padding-bottom: 10px; font-family: Arial,Helvetica,sans-serif; background-color: #000; color: #FFF; }*/
-	/* options_tab */
-	UL.options_tab		{ text-align: left; cursor: pointer; cursor: hand; list-style-type: none; display: inline; padding-left: 0px; background-color: #000; font-size: 100%; font-weight: bold; height: 24px; margin: 0; margin-left: 0px; list-style-image: none; overflow: hidden; }
-	/* selected tab button */
-	LI.options_tab_sel	{ padding-left: 10px; padding-right: 10px; padding-bottom: 2px; padding-top: 2px; border-top: 1px solid #888; display: inline; float: left; border-left: 1px solid #888; border-right: 1px solid #888; border-bottom: 0px solid #888; margin: 0; margin-left: 0px; margin-bottom: 5px; }
-	/* unselected tab button */
-	LI.options_tab		{ padding-left: 10px; padding-right: 10px; padding-bottom: 2px; padding-top: 2px; border-top: 1px solid #444; display: inline; float: left; border-left: 1px solid #444; border-right: 1px solid #444; border-bottom: 1px solid #888; margin: 0; margin-left: 0px; margin-bottom: 5px; }
-	/* unselected tab button */
-	LI.options_button	{ padding-left: 10px; padding-right: 10px; padding-bottom: 2px; padding-top: 2px; border-top: 1px solid #888; display: inline; float: left; border-left: 1px solid #888; border-right: 1px solid #888; border-bottom: 1px solid #888; margin: 0; margin-right: 5px; margin-bottom: 5px; }
+	ul.nav {
+		border-bottom: 4px solid #888;
+	}
 
-	TABLE.options		{ font-size: 100%; text-align: left; border-spacing: 0px; padding: 0; white-space: nowrap; }
-	TR.options		{ white-space: nowrap; }
-	TH.options		{ padding-right: 4px; text-align: left; }
-	TD.options		{ }
-	LABEL.options		{ font-size: 100%; } 
-	INPUT.options[type="radio"],INPUT.options[type="checkbox"] { font-size: 100%; background:none; }
-	INPUT.options		{ font-size: 100%; } 
-	SELECT.options		{ font-size: 100%; } 
+	ul.options_tab {
+		border-bottom: 2px solid #888;
+	}
 
-	TABLE.options_outer	{ font-size: 70%; text-align: left; border-spacing: 0px 0px; padding: 0; white-space: nowrap; overflow: visible; table-layout: fixed; }
-	TR.options_outer	{ vertical-align: top; white-space: nowrap; }
-	TH.options_outer	{ }
-	TD.options_outer	{ padding-right: 50px; }
-	LABEL.options_outer	{ font-weight: bold; font-size: 120%; color: #F54997; font-family: Arial,Helvetica,sans-serif; } 
-	LABEL.options_heading	{ font-weight: bold; font-size: 110%; color: #CCC; } 
-	
-	/* Action bar */
-	DIV.action		{ padding-top: 10px; padding-bottom: 10px; font-family: Arial,Helvetica,sans-serif; background-color: #000; color: #FFF; }
-	UL.action		{ padding-left: 0px; background-color: #000; font-size: 100%; font-weight: bold; height: 24px; margin: 0; margin-left: 0px; list-style-image: none; overflow: hidden; }
-	LI.action		{ cursor: pointer; cursor: hand; padding-left: 0px; border-top: 1px solid #888; border-left: 1px solid #666; border-right: 1px solid #666; border-bottom: 1px solid #666; display: inline; float: left; height: 22px; margin: 0; margin-left: 2px; width: 13.0%; }
-	A.action		{ color: #FFF; display: block; height: 42px; line-height: 22px; text-align: center; }
-	IMG.action		{ padding: 7px; display: block; text-align: center; text-decoration: none; }
-	A.action:hover		{ color: #ADADAD; }
+	ul.nav > li,
+	ul.options_tab > li,
+	ul.action > li {
+		background: #444;
+		display: inline-block;
+		vertical-align: bottom;
+		margin: 0 4px;
+	}
 
-	TABLE.pagetrail		{ font-size: 70%; text-align: center; font-weight: bold; border-spacing: 10px 0; padding: 0px; }
-	#centered		{ height:20px; margin:0px auto 0; position: relative; }
-	LABEL.pagetrail		{ color: #FFF; }
-	LABEL.pagetrail-current	{ color: #F54997; }
+	ul.nav > li,
+	ul.action > li {
+		padding: 4px 16px;
+	}
 
-	TABLE.colselect		{ font-size: 70%; color: #fff; background: #333; border-spacing: 2px; padding: 0; }
-	TR.colselect		{ text-align: left; }
-	TH.colselect		{ font-weight: bold; }
-	INPUT.colselect		{ font-size: 70%; }
-	LABEL.colselect		{ font-size: 70%; }
-	
-	TABLE.search		{ font-size: 70%; color: #fff; background: #333; border-spacing: 2px; padding: 0; width: 100%; }
-	TABLE.searchhead	{ font-size: 110%; border-spacing: 0px; padding: 0; width: 100%; }
-	TR.search		{ background: #444; }
-	TR.search:hover		{ background: #555; }
-	TH.search		{ color: #FFF; text-align: center; background: #000; text-align: center; }
-	TD.search		{ text-align: left; }
-	A.search		{ }
-	LABEL.search		{ text-decoration: none; }
-	INPUT.search		{ font-size: 70%; background: none; }
-	LABEL.sorted            { color: #CFC; }
-	LABEL.unsorted          { color: #FFF; }
-	LABEL.sorted_reverse    { color: #FCC; }
-	INPUT.edit		{ font-size: 100%; background: #DDD; }
+	ul.options_tab > li {
+		padding: 2px 8px;
+	}
 
-	TABLE.info		{ font-size: 70%; color: #fff; background: #333; border-spacing: 2px; padding: 0; }
-	TR.info			{ background: #444; }
-	TR.info:hover		{ background: #555; }
-	TH.info			{ color: #FFF; text-align: center; background: #000; text-align: center; }
-	TD.info			{ text-align: left; }
-	A.info			{ text-decoration: underline; }
-	A.info:hover		{ }
+	ul.nav > li:hover,
+	ul.options_tab > li:hover,
+	ul.action > li:hover {
+		background: #666;
+	}
 
-	B.footer		{ font-size: 70%; color: #777; font-weight: normal; }
-	.logotext		{ font-size: 24px; font-family: "Courier New",monospace; color: #F54997; }
+	ul.nav > li.nav_tab_sel,
+	ul.options_tab > li.options_tab_sel {
+		background: #888;
+	}
+
+	table.options_outer > tbody > tr {
+		font-size: 0.875em;
+	}
+
+	table.options_outer td,
+	table.options_outer th,
+	table.info td,
+	table.info th {
+		vertical-align: top;
+		text-align: left;
+	}
+
+	table.options,
+	table_options_embedded {
+		border-spacing: 1;
+	}
+
+	table.pagetrail {
+		margin-left: auto;
+		margin-right: auto;
+		margin-top: 8px;
+		margin-bottom: 8px;
+		font-size: 1em;
+		font-weight: bold;
+		border-spacing: 10px 0;
+		padding: 0px;
+	}
+
+	label.pagetrail-current	{
+		color: #F54997;
+	}
+
+	table.search,
+	table.info {
+		border: 2px solid #333;
+		border-collapse: collapse;
+		width: 100%;
+	}
+
+	table.search > tbody > tr,
+	table.info > tbody > tr {
+		background: #444;
+		font-size: 0.875em;
+	}
+
+	table.search > tbody > tr:hover,
+	table.info > tbody > tr:hover {
+		background: #666;
+	}
+
+	table.search > tbody > tr > th,
+	table.info > tbody > tr > th {
+		background: #000;
+		text-align: center;
+	}
+
+	table.search > tbody > tr > td,
+	table.search > tbody > tr > th,
+	table.info > tbody > tr > td,
+	table.info > tbody > tr > th {
+		border: 1px solid #333;
+		padding: 4px 8px;
+	}
+
+	table.searchhead {
+		width: 100%;
+	}
+
+	label.sorted {
+		color: #CFC;
+	}
+
+	label.sorted_reverse {
+		color: #FCC;
+	}
+
+	b.footer {
+		color: #777;
+		font-size: 0.75em;
+		font-weight: normal;
+	}
+
+	#nowrap {
+		white-space: nowrap;
+	}
+
+	#logo {
+		background: none;
+		margin: 0;
+	}
+
+	#logo .logotext {
+		color: #F54997;
+		font-family: "Courier New", monospace;
+	}
+
+	.darker {
+		color: #7D7D7D;
+	}
+
 	</STYLE>
 EOF
 
